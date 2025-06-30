@@ -307,5 +307,14 @@ def main():
         
     print("Training finished.")
 
+    # --- Save the final model ---
+    print("Saving the final model...")
+    save_dir = 'saved_models'
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, 'final_flood_predictor.pth')
+    # We save the state_dict of the compiled model's original module
+    torch.save(model._orig_mod.state_dict(), save_path)
+    print(f"Model saved to {save_path}")
+
 if __name__ == '__main__':
     main() 
