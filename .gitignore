@@ -70,6 +70,7 @@ data/
 *.csv
 *.npy
 dem_flt*/
+WLDAS*/
 
 # Jupyter Notebook
 .ipynb_checkpoints 

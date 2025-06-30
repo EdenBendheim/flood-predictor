@@ -212,7 +212,7 @@ if __name__ == '__main__':
     print("Initializing dataset...")
     dataset = FloodDataset(
         root='./data/flood_dataset_test_parallel', # Use a new root to trigger processing
-        wldas_dir='preprocessing/Caldor/Caldor Paper/WLDAS_2012',
+        wldas_dir='WLDAS_2012',
         flood_csv='preprocessing/Caldor/Caldor Paper/FloodPredictor/USFD_v1.0.csv',
         mode='test' # Use a smaller dataset for testing
     )

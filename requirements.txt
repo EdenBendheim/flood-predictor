@@ -1,0 +1,8 @@
+torch
+torch_geometric
+pandas
+xarray
+numpy
+tqdm
+scipy
+netcdf4

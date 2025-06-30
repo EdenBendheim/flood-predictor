@@ -15,6 +15,7 @@ from gcn_model import SpatioTemporalGCN
 # The cuDNN LSTM implementation can be sensitive to very large inputs.
 # Disabling it can help diagnose if the issue is with cuDNN itself.
 torch.backends.cudnn.enabled = False
+# torch.backends.cuda.matmul.allow_tf32 = True
 
 # --- Prefetcher for Data Loading ---
 class Prefetcher:
@@ -188,15 +189,19 @@ def main():
     HIDDEN_DIM = 128
     LSTM_LAYERS = 2
     GCN_LAYERS = 2
-    BATCH_SIZE = 32768
+    BATCH_SIZE = 20000
     NEIGHBOR_SAMPLES = [10, 5]
     
     # --- Setup ---
+    # Get the absolute path of the directory where the script is located
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
     # Use a reasonable number of workers
-    num_workers = min(os.cpu_count(), 12)
+    # Reducing from 12 to 4 to lower system RAM usage from parallel data loading.
+    num_workers = min(os.cpu_count(), 8)
     print(f"Using {num_workers} workers for data loading.")
 
     # --- Dataset ---
@@ -204,18 +209,18 @@ def main():
     # Using new root directories to trigger the parallelized pre-processing
     print("Loading training dataset...")
     train_dataset = FloodDataset(
-        root='./data/flood_dataset_train_parallel', 
-        wldas_dir='/home/bendhe/MNIST_CSV/preprocessing/Caldor/Caldor Paper/WLDAS_2012',
-        flood_csv='/home/bendhe/MNIST_CSV/preprocessing/Caldor/Caldor Paper/FloodPredictor/USFD_v1.0.csv',
+        root=os.path.join(script_dir, 'data/flood_dataset_train_parallel'), 
+        wldas_dir=os.path.join(script_dir, 'WLDAS_2012'),
+        flood_csv=os.path.join(script_dir, 'USFD_v1.0.csv'),
         mode='train'
     )
     print("Training dataset loaded successfully.")
 
     print("Loading testing dataset...")
     test_dataset = FloodDataset(
-        root='./data/flood_dataset_test_parallel',
-        wldas_dir='/home/bendhe/MNIST_CSV/preprocessing/Caldor/Caldor Paper/WLDAS_2012',
-        flood_csv='/home/bendhe/MNIST_CSV/preprocessing/Caldor/Caldor Paper/FloodPredictor/USFD_v1.0.csv',
+        root=os.path.join(script_dir, 'data/flood_dataset_test_parallel'),
+        wldas_dir=os.path.join(script_dir, 'WLDAS_2012'),
+        flood_csv=os.path.join(script_dir, 'USFD_v1.0.csv'),
         mode='test'
     )
     print("Testing dataset loaded successfully.")
@@ -309,7 +314,7 @@ def main():
 
     # --- Save the final model ---
     print("Saving the final model...")
-    save_dir = 'saved_models'
+    save_dir = os.path.join(script_dir, 'saved_models')
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, 'final_flood_predictor.pth')
     # We save the state_dict of the compiled model's original module
