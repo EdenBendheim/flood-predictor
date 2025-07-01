@@ -2,9 +2,9 @@ import numpy as np
 import os
 import re
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
+# import matplotlib.pyplot as plt
+# import cartopy.crs as ccrs
+# import cartopy.feature as cfeature
 
 def read_dem_flt(file_path, rows=6000, cols=6000):
     """
@@ -135,13 +135,14 @@ def parse_filename(filepath):
         lon = -lon
     return lat, lon
 
-def process_dem_data(base_dem_dir='/home/bendhe/MNIST_CSV/preprocessing/Caldor/Caldor Paper/FloodPredictor'):
-    print("Scanning DEM directories...")
+def process_dem_data():
+    base_dem_dir = os.path.dirname(os.path.abspath(__file__))
+    print(f"Scanning DEM directories in {base_dem_dir}...")
     all_dem_files = []
-    for dir_name in os.listdir(base_dem_dir):
-        full_dir_path = os.path.join(base_dem_dir, dir_name)
-        if os.path.isdir(full_dir_path) and 'dem' in dir_name.lower():
-            all_dem_files.extend(find_dem_files(full_dir_path))
+    for item in os.listdir(base_dem_dir):
+        full_path = os.path.join(base_dem_dir, item)
+        if os.path.isdir(full_path) and 'dem' in item.lower():
+            all_dem_files.extend(find_dem_files(full_path))
     
     if not all_dem_files:
         raise FileNotFoundError(f"No DEM .flt files found in subdirectories of {base_dem_dir}")
