@@ -29,6 +29,10 @@
 # JOB EXECUTION
 #=========================================================================================
 
+export OMP_NUM_THREADS=10
+export MKL_NUM_THREADS=10
+export TORCH_NUM_THREADS=10
+
 # Print job information
 echo "==============================================================================="
 echo "SLURM JOB ID: $SLURM_JOBID"
