@@ -171,7 +171,7 @@ class FloodDataset(Dataset):
         print("Elevation grid and graph structure are ready.")
 
         # --- Parallel processing of daily graph data ---
-        num_cores = min(cpu_count(), 16) # Cap at 16 cores to be reasonable
+        num_cores = min(cpu_count(), 10) # Cap at 16 cores to be reasonable
         print(f"Processing {self.len()} days of data using {num_cores} cores...")
 
         # Use functools.partial to pre-fill arguments for the worker function
@@ -202,7 +202,7 @@ class FloodDataset(Dataset):
 
     def get(self, idx):
         # Load the pre-processed data file
-        data = torch.load(os.path.join(self.processed_dir, f'data_{idx}.pt'), weights_only=False)
+        data = torch.load(os.path.join(self.processed_dir, f'data_{idx}.pt'))
         return data
 
 if __name__ == '__main__':

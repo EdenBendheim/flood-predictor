@@ -146,16 +146,16 @@ def main(rank, world_size):
     # --- Hyperparameters ---
     EPOCHS = 10
     LEARNING_RATE = 0.001 * world_size # Scale learning rate
-    HIDDEN_DIM = 256 # Increased model capacity
-    LSTM_LAYERS = 3
-    GCN_LAYERS = 3
-    BATCH_SIZE = 32000 # Increased batch size per GPU
-    NEIGHBOR_SAMPLES = [15, 10, 5] # Deeper neighborhood sampling
+    HIDDEN_DIM = 124 # Increased model capacity
+    LSTM_LAYERS = 1
+    GCN_LAYERS = 2
+    BATCH_SIZE = 8000 # Increased batch size per GPU
+    NEIGHBOR_SAMPLES = [10, 5] # Deeper neighborhood sampling
     
     # --- Setup ---
     script_dir = os.path.dirname(os.path.abspath(__file__))
     device = torch.device(f'cuda:{rank}')
-    num_workers = 16 // world_size # Allocate CPU cores per GPU
+    num_workers = 4 // world_size # Allocate CPU cores per GPU
     
     # --- Dataset ---
     train_dataset = FloodDataset(
@@ -184,7 +184,7 @@ def main(rank, world_size):
         gcn_layers=GCN_LAYERS,
     ).to(device)
     
-    model = DDP(model, device_ids=[rank])
+    model = DDP(model, device_ids=[rank], find_unused_parameters=True)
     
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scaler = torch.amp.GradScaler(enabled=True)
