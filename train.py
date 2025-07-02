@@ -1,5 +1,6 @@
 import os
 import torch
+import sys
 import torch.optim as optim
 from tqdm import tqdm
 import torch.nn as nn
@@ -78,7 +79,7 @@ def train_one_day(model, day_data, optimizer, device, batch_size, num_neighbors,
 
     total_loss = 0
     num_batches = 0
-    progress_bar = tqdm(loader, desc="Day's Batches", leave=False)
+    progress_bar = tqdm(loader, desc="Day's Batches", leave=False, disable=not sys.stdout.isatty())
     for batch in progress_bar:
         batch = batch.to(device)
         optimizer.zero_grad(set_to_none=True)
@@ -120,7 +121,7 @@ def test_one_day(model, day_data, device, batch_size, num_neighbors, num_workers
     total_loss = 0
     num_batches = 0
     day_preds, day_labels = [], []
-    for batch in tqdm(loader, desc="Day's Batches (Test)", leave=False):
+    for batch in tqdm(loader, desc="Day's Batches (Test)", leave=False, disable=not sys.stdout.isatty()):
         batch = batch.to(device)
         with torch.amp.autocast(device_type=device.type):
             out = model(batch)
@@ -199,7 +200,7 @@ def main(rank, world_size):
         epoch_total_loss = 0
         
         train_prefetcher = Prefetcher(train_dataset, train_sampler)
-        for day_data in tqdm(train_prefetcher, desc=f"Epoch {epoch:02d}", unit="day", total=len(train_prefetcher)):
+        for day_data in tqdm(train_prefetcher, desc=f"Epoch {epoch:02d}", unit="day", total=len(train_prefetcher), disable=not sys.stdout.isatty()):
             day_loss = train_one_day(model, day_data, optimizer, device, BATCH_SIZE, NEIGHBOR_SAMPLES, scaler, num_workers)
             epoch_total_loss += day_loss
         
@@ -211,7 +212,7 @@ def main(rank, world_size):
             epoch_preds, epoch_labels = [], []
             
             test_prefetcher = Prefetcher(test_dataset, test_sampler)
-            for day_data in tqdm(test_prefetcher, desc=f"Epoch {epoch:02d} (Test)", unit="day", total=len(test_prefetcher)):
+            for day_data in tqdm(test_prefetcher, desc=f"Epoch {epoch:02d} (Test)", unit="day", total=len(test_prefetcher), disable=not sys.stdout.isatty()):
                 day_loss, day_preds, day_labels = test_one_day(model.module, day_data, device, BATCH_SIZE, NEIGHBOR_SAMPLES, num_workers)
                 test_total_loss += day_loss
                 if day_preds.numel() > 0:
