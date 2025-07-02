@@ -45,6 +45,7 @@ echo "Modules loaded."
 echo ""
 
 echo "Activating Conda environment..."
+source $(conda info --base)/etc/profile.d/conda.sh
 conda activate cuda-flood
 echo "Conda environment 'cuda-flood' activated."
 echo ""
