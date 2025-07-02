@@ -10,7 +10,9 @@ import threading
 import queue
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+import gc
 
 from FloodData import FloodDataset
 from gcn_model import SpatioTemporalGCN
@@ -19,41 +21,6 @@ from gcn_model import SpatioTemporalGCN
 # Enables cuDNN for GPU acceleration, which is crucial for performance.
 # The benchmark mode finds the best algorithm for the specific input sizes.
 torch.backends.cudnn.benchmark = True
-
-# --- Prefetcher for Data Loading ---
-class Prefetcher:
-    def __init__(self, dataset, sampler, num_prefetch=1):
-        self.dataset = dataset
-        self.sampler = sampler
-        self.num_prefetch = num_prefetch
-        self.queue = queue.Queue(maxsize=self.num_prefetch)
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.data_iter = iter(self.dataset)
-        self.thread.start()
-
-    def _run(self):
-        try:
-            for index in self.sampler:
-                item = self.dataset[index]
-                self.queue.put(item)
-            self.queue.put(None)  # Sentinel to signal end
-        except Exception as e:
-            print(f"Error in prefetcher thread: {e}")
-            self.queue.put(e)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        item = self.queue.get()
-        if item is None:
-            raise StopIteration
-        if isinstance(item, Exception):
-            raise item
-        return item
-
-    def __len__(self):
-        return len(self.sampler)
 
 def setup(rank, world_size):
     """Initializes the distributed environment."""
@@ -103,6 +70,9 @@ def train_one_day(model, day_data, optimizer, device, batch_size, num_neighbors,
         num_batches += 1
         progress_bar.set_postfix(loss=f'{loss.item():.4f}')
         
+    # Explicitly clean up to free resources from the NeighborLoader
+    del loader
+    gc.collect()
     return total_loss / num_batches if num_batches > 0 else 0
 
 @torch.no_grad()
@@ -139,6 +109,9 @@ def test_one_day(model, day_data, device, batch_size, num_neighbors, num_workers
         day_preds = torch.cat(day_preds, dim=0)
         day_labels = torch.cat(day_labels, dim=0)
     
+    # Explicitly clean up to free resources from the NeighborLoader
+    del loader
+    gc.collect()
     return avg_loss, day_preds, day_labels
 
 def main(rank, world_size):
@@ -156,7 +129,8 @@ def main(rank, world_size):
     # --- Setup ---
     script_dir = os.path.dirname(os.path.abspath(__file__))
     device = torch.device(f'cuda:{rank}')
-    num_workers = 12 // world_size # Allocate CPU cores per GPU
+    # num_workers for the inner NeighborLoader, per GPU.
+    num_workers_neighbor = 2 
     
     # --- Dataset ---
     train_dataset = FloodDataset(
@@ -175,8 +149,28 @@ def main(rank, world_size):
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False)
 
+    # Use a standard DataLoader to iterate over days, which is more robust
+    # than the custom prefetcher for managing worker processes.
+    train_day_loader = DataLoader(
+        train_dataset,
+        sampler=train_sampler,
+        batch_size=None,  # Important: yields one day_data at a time
+        num_workers=world_size * 1, # A few persistent workers to load day files
+        prefetch_factor=2,
+        persistent_workers=True,
+    )
+    test_day_loader = DataLoader(
+        test_dataset,
+        sampler=test_sampler,
+        batch_size=None,
+        num_workers=world_size * 1,
+        prefetch_factor=2,
+        persistent_workers=True,
+    )
+
     # --- Model ---
-    sample_data = train_dataset[0]
+    # Load one sample to infer model dimensions
+    sample_data = next(iter(train_day_loader))
     model = SpatioTemporalGCN(
         static_feature_dim=sample_data.x_static.shape[1],
         dynamic_feature_dim=sample_data.x_dynamic.shape[2],
@@ -199,21 +193,20 @@ def main(rank, world_size):
         train_sampler.set_epoch(epoch)
         epoch_total_loss = 0
         
-        train_prefetcher = Prefetcher(train_dataset, train_sampler)
-        for day_data in tqdm(train_prefetcher, desc=f"Epoch {epoch:02d}", unit="day", total=len(train_prefetcher), disable=not sys.stdout.isatty()):
-            day_loss = train_one_day(model, day_data, optimizer, device, BATCH_SIZE, NEIGHBOR_SAMPLES, scaler, num_workers)
+        # Iterate over the robust day loader
+        for day_data in tqdm(train_day_loader, desc=f"Epoch {epoch:02d}", unit="day", total=len(train_sampler), disable=not sys.stdout.isatty()):
+            day_loss = train_one_day(model, day_data, optimizer, device, BATCH_SIZE, NEIGHBOR_SAMPLES, scaler, num_workers_neighbor)
             epoch_total_loss += day_loss
         
-        avg_epoch_loss = epoch_total_loss / len(train_prefetcher)
+        avg_epoch_loss = epoch_total_loss / len(train_sampler)
         
         # --- Evaluation Step (on rank 0) ---
         if rank == 0:
             test_total_loss = 0
             epoch_preds, epoch_labels = [], []
             
-            test_prefetcher = Prefetcher(test_dataset, test_sampler)
-            for day_data in tqdm(test_prefetcher, desc=f"Epoch {epoch:02d} (Test)", unit="day", total=len(test_prefetcher), disable=not sys.stdout.isatty()):
-                day_loss, day_preds, day_labels = test_one_day(model.module, day_data, device, BATCH_SIZE, NEIGHBOR_SAMPLES, num_workers)
+            for day_data in tqdm(test_day_loader, desc=f"Epoch {epoch:02d} (Test)", unit="day", total=len(test_sampler), disable=not sys.stdout.isatty()):
+                day_loss, day_preds, day_labels = test_one_day(model.module, day_data, device, BATCH_SIZE, NEIGHBOR_SAMPLES, num_workers_neighbor)
                 test_total_loss += day_loss
                 if day_preds.numel() > 0:
                     epoch_preds.append(day_preds)
