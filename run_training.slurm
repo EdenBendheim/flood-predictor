@@ -14,7 +14,7 @@
 #SBATCH --ntasks=1                         # We are launching one main python script
 #SBATCH --gres=gpu:6                       # Requesting 6 GPUs. This will also allocate 60 CPUs by default.
 #SBATCH --mem=600G                         # Requesting 600 GB of system RAM
-#SBATCH --time=10:00:00                    # Total run time limit (HH:MM:SS). Adjust as needed.
+#SBATCH --time=5:55:00                    # Total run time limit (HH:MM:SS). Adjust as needed.
 #
 #-----------------------------------------------------------------------------------------
 # EMAIL NOTIFICATIONS
