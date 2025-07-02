@@ -149,13 +149,13 @@ def main(rank, world_size):
     HIDDEN_DIM = 124 # Increased model capacity
     LSTM_LAYERS = 1
     GCN_LAYERS = 2
-    BATCH_SIZE = 8000 # Increased batch size per GPU
+    BATCH_SIZE = 50000 # Increased batch size per GPU
     NEIGHBOR_SAMPLES = [10, 5] # Deeper neighborhood sampling
     
     # --- Setup ---
     script_dir = os.path.dirname(os.path.abspath(__file__))
     device = torch.device(f'cuda:{rank}')
-    num_workers = 4 // world_size # Allocate CPU cores per GPU
+    num_workers = 12 // world_size # Allocate CPU cores per GPU
     
     # --- Dataset ---
     train_dataset = FloodDataset(
@@ -190,6 +190,9 @@ def main(rank, world_size):
     scaler = torch.amp.GradScaler(enabled=True)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
 
+    # --- Best model tracking ---
+    best_val_loss = float('inf')
+
     # --- Training Loop ---
     for epoch in range(1, EPOCHS + 1):
         train_sampler.set_epoch(epoch)
@@ -221,23 +224,42 @@ def main(rank, world_size):
             if epoch_preds and epoch_labels:
                 all_preds = torch.cat(epoch_preds)
                 all_labels = torch.cat(epoch_labels).long()
-                true_positives = ((all_preds == 1) & (all_labels == 1)).sum().item()
-                false_positives = ((all_preds == 1) & (all_labels == 0)).sum().item()
-                false_negatives = ((all_preds == 0) & (all_labels == 1)).sum().item()
-                total_floods = true_positives + false_negatives
-                accuracy = (true_positives + ((all_preds == 0) & (all_labels == 0)).sum().item()) / len(all_labels)
-                print(f'  Test Metrics: Accuracy: {accuracy:.4f} | Total Actual Floods: {total_floods}')
-                print(f'    > Missed Floods (FN): {false_negatives} | False Alarms (FP): {false_positives}')
+                
+                # Calculate metrics
+                tp = ((all_preds == 1) & (all_labels == 1)).sum().item()
+                fp = ((all_preds == 1) & (all_labels == 0)).sum().item()
+                fn = ((all_preds == 0) & (all_labels == 1)).sum().item()
+                tn = ((all_preds == 0) & (all_labels == 0)).sum().item()
+                
+                precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+                accuracy = (tp + tn) / (tp + tn + fp + fn)
+
+                print(f'  Test Metrics: Accuracy: {accuracy:.4f} | F1-Score: {f1_score:.4f}')
+                print(f'    > Precision: {precision:.4f} | Recall: {recall:.4f}')
+                print(f'    > Missed Floods (FN): {fn} | False Alarms (FP): {fp}')
+
+            # --- Save Model Checkpoints ---
+            save_dir = os.path.join(script_dir, 'saved_models')
+            os.makedirs(save_dir, exist_ok=True)
+            
+            # Save the latest model
+            latest_save_path = os.path.join(save_dir, f'flood_predictor_epoch_{epoch}.pth')
+            torch.save(model.module.state_dict(), latest_save_path)
+            print(f'Epoch {epoch} model saved to {latest_save_path}')
+
+            # Save the best model if validation loss has improved
+            if avg_test_loss < best_val_loss:
+                best_val_loss = avg_test_loss
+                best_save_path = os.path.join(save_dir, 'best_flood_predictor.pth')
+                torch.save(model.module.state_dict(), best_save_path)
+                print(f'New best model saved to {best_save_path} (Val Loss: {best_val_loss:.4f})')
 
         scheduler.step()
         
     if rank == 0:
         print("Training finished.")
-        save_dir = os.path.join(script_dir, 'saved_models')
-        os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(save_dir, 'final_flood_predictor_ddp.pth')
-        torch.save(model.module.state_dict(), save_path)
-        print(f"Model saved to {save_path}")
         
     cleanup()
 
