@@ -136,6 +136,10 @@ class FloodDataset(Dataset):
         with xr.open_dataset(sample_wldas_file) as ds:
             target_rows, target_cols = ds.sizes['lat'], ds.sizes['lon']
 
+        # Ensure agg_grid is 3D for zoom compatibility
+        if agg_grid.ndim == 2:
+            agg_grid = agg_grid[:, :, np.newaxis]
+
         zoom_factors = (target_rows / agg_grid.shape[0], target_cols / agg_grid.shape[1], 1)
         agg_grid = zoom(agg_grid, zoom_factors, order=1)
         
@@ -145,33 +149,50 @@ class FloodDataset(Dataset):
         # Create graph structure
         edges, weights = [], []
         mean_elevation = agg_grid[:, :, 0]
-        mean_elev_std = mean_elevation.std()
-        if mean_elev_std > 0:
-            mean_elevation = (mean_elevation - mean_elevation.mean()) / mean_elev_std
+        
+        # Normalize elevation to be used in weight calculation
+        min_elev, max_elev = np.nanmin(mean_elevation), np.nanmax(mean_elevation)
+        if max_elev > min_elev:
+            normalized_elevation = (mean_elevation - min_elev) / (max_elev - min_elev)
         else:
-            mean_elevation = np.zeros_like(mean_elevation)
-        gamma = 1.0
+            normalized_elevation = np.zeros_like(mean_elevation)
+
         for r in range(n_rows):
             for c in range(n_cols):
                 node_idx = r * n_cols + c
-                node_elev = mean_elevation[r, c]
+                node_elev = normalized_elevation[r, c]
+                
+                if np.isnan(node_elev): continue
+
                 for dr in [-1, 0, 1]:
                     for dc in [-1, 0, 1]:
                         if dr == 0 and dc == 0: continue
                         nr, nc = r + dr, c + dc
+                        
                         if 0 <= nr < n_rows and 0 <= nc < n_cols:
                             neighbor_idx = nr * n_cols + nc
-                            neighbor_elev = mean_elevation[nr, nc]
-                            edges.append([node_idx, neighbor_idx])
-                            elev_diff = abs(node_elev - neighbor_elev)
-                            weight = np.exp(-gamma * elev_diff)
-                            weights.append(weight)
-        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
-        edge_weight = torch.tensor(weights, dtype=torch.float)
+                            neighbor_elev = normalized_elevation[nr, nc]
+
+                            if np.isnan(neighbor_elev): continue
+                            
+                            # Create a directed edge from higher to lower elevation
+                            if node_elev > neighbor_elev:
+                                edges.append([node_idx, neighbor_idx])
+                                # Weight is the elevation difference
+                                weights.append(node_elev - neighbor_elev)
+
+        if not edges:
+            # Handle case with no edges to avoid errors
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+            edge_weight = torch.empty((0,), dtype=torch.float)
+        else:
+            edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+            edge_weight = torch.tensor(weights, dtype=torch.float)
+
         print("Elevation grid and graph structure are ready.")
 
         # --- Parallel processing of daily graph data ---
-        num_cores = min(cpu_count(), 10) # Cap at 16 cores to be reasonable
+        num_cores = min(cpu_count(), 16) # Cap at 16 cores to be reasonable
         print(f"Processing {self.len()} days of data using {num_cores} cores...")
 
         # Use functools.partial to pre-fill arguments for the worker function
@@ -202,7 +223,7 @@ class FloodDataset(Dataset):
 
     def get(self, idx):
         # Load the pre-processed data file
-        data = torch.load(os.path.join(self.processed_dir, f'data_{idx}.pt'))
+        data = torch.load(os.path.join(self.processed_dir, f'data_{idx}.pt'), weights_only=False)
         return data
 
 if __name__ == '__main__':

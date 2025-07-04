@@ -71,6 +71,7 @@ data/
 *.npy
 dem_flt*/
 WLDAS*/
+saved_models*/
 
 # Jupyter Notebook
-.ipynb_checkpoints 
+.ipynb_checkpoints saved_models/
