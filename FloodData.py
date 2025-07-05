@@ -14,7 +14,7 @@ from read_dem import process_dem_data
 
 # Helper function for parallel processing
 # It must be defined at the top level to be pickleable by multiprocessing
-def process_single_day(idx, processed_dir, wldas_files, flood_data_path, agg_grid, lat_min_us, lat_max_us, lon_min_us, lon_max_us, n_rows, n_cols, num_nodes, edge_index, edge_weight):
+def process_single_day(idx, processed_dir, wldas_files, preprocessed_flood_df, agg_grid, lat_min_us, lat_max_us, lon_min_us, lon_max_us, n_rows, n_cols, num_nodes, edge_index, edge_weight):
     try:
         # Recreate the necessary parts of the dataset object for one sample
         # This avoids pickling large objects
@@ -45,24 +45,11 @@ def process_single_day(idx, processed_dir, wldas_files, flood_data_path, agg_gri
         target_day_idx = idx + 14
         target_date_str = os.path.basename(wldas_files[target_day_idx]).split('_')[-1].split('.')[0]
         
-        # Load flood data inside the worker
-        flood_df = pd.read_csv(
-            flood_data_path, 
-            usecols=['DATE_BEGIN', 'DATE_END', 'LAT', 'LON'], 
-            dtype=str,
-            encoding='latin1'
-        )
-        
         y = torch.zeros(num_nodes, dtype=torch.float)
         date_part = target_date_str.split('_')[-1]
         target_date = pd.to_datetime(date_part, format='%Y%m%d')
 
-        flood_df['DATE_BEGIN'] = flood_df['DATE_BEGIN'].astype(str).str.replace(r'\.0$', '', regex=True)
-        flood_df['DATE_END'] = flood_df['DATE_END'].astype(str).str.replace(r'\.0$', '', regex=True)
-        begin_dates = pd.to_datetime(flood_df['DATE_BEGIN'], format='%Y%m%d%H%M%S', errors='coerce')
-        end_dates = pd.to_datetime(flood_df['DATE_END'], format='%Y%m%d%H%M%S', errors='coerce')
-        valid_dates_mask = begin_dates.notna() & end_dates.notna()
-        daily_floods = flood_df[valid_dates_mask & (begin_dates.dt.date <= target_date.date()) & (end_dates.dt.date >= target_date.date())]
+        daily_floods = preprocessed_flood_df[(preprocessed_flood_df['begin_dates_dt'].dt.date <= target_date.date()) & (preprocessed_flood_df['end_dates_dt'].dt.date >= target_date.date())]
 
         if not daily_floods.empty:
             lats = pd.to_numeric(daily_floods['LAT'], errors='coerce')
@@ -76,20 +63,53 @@ def process_single_day(idx, processed_dir, wldas_files, flood_data_path, agg_gri
                 row_fracs = (lat_max_us - lats) / (lat_max_us - lat_min_us)
                 col_fracs = (lons - lon_min_us) / (lon_max_us - lon_min_us)
                 
-                grid_rows = (row_fracs * n_rows).astype(np.int32)
-                grid_cols = (col_fracs * n_cols).astype(np.int32)
+                grid_rows = (row_fracs * n_rows).astype(int)
+                grid_cols = (col_fracs * n_cols).astype(int)
 
+                # Clamp values to be within bounds
                 grid_rows = np.clip(grid_rows, 0, n_rows - 1)
                 grid_cols = np.clip(grid_cols, 0, n_cols - 1)
+
+                # --- Smear the flood event with a weighted circular kernel ---
+                radius = 5
+                radius_sq = radius**2
+
+                # Pre-calculate kernel offsets and weights in NumPy
+                y_k, x_k = np.mgrid[-radius:radius+1, -radius:radius+1]
+                dist_sq = y_k**2 + x_k**2
+                mask = dist_sq <= radius_sq
                 
-                node_indices = grid_rows * n_cols + grid_cols
-                
-                unique_indices = np.unique(node_indices)
-                valid_indices_mask = (unique_indices >= 0) & (unique_indices < num_nodes)
-                valid_indices = unique_indices[valid_indices_mask]
-                
-                if valid_indices.size > 0:
-                    y[valid_indices] = 1
+                # Get kernel offsets for valid points within the circle
+                dy, dx = np.where(mask)
+                dy -= radius
+                dx -= radius
+
+                # Calculate weights with a linear falloff
+                weights = 1 - (np.sqrt(dist_sq[mask]) / radius)
+
+                # Convert kernel info to torch tensors for efficiency
+                # This is done once per day, outside the flood event loop
+                dy_t = torch.tensor(dy, dtype=torch.long)
+                dx_t = torch.tensor(dx, dtype=torch.long)
+                weights_t = torch.tensor(weights, dtype=torch.float)
+
+                # Iterate through each flood's center point
+                for r, c in zip(grid_rows, grid_cols):
+                    # Calculate neighbor coordinates by applying the kernel offsets
+                    nr, nc = r + dy_t, c + dx_t
+                    
+                    # Filter for neighbors that are within the grid bounds
+                    valid_mask = (nr >= 0) & (nr < n_rows) & (nc >= 0) & (nc < n_cols)
+                    nr_valid, nc_valid = nr[valid_mask], nc[valid_mask]
+                    weights_valid = weights_t[valid_mask]
+                    
+                    # Convert 2D coordinates to 1D node indices
+                    node_indices = nr_valid * n_cols + nc_valid
+                    
+                    if node_indices.numel() > 0:
+                        # Update the target 'y' tensor, taking the max weight if a cell
+                        # is affected by multiple overlapping flood circles.
+                        y[node_indices] = torch.maximum(y[node_indices], weights_valid)
 
         # --- Create and save Data object ---
         data = Data(
@@ -203,6 +223,21 @@ class FloodDataset(Dataset):
 
         print("Elevation grid and graph structure are ready.")
 
+        # --- Pre-process flood data once ---
+        print("Preparing flood data for efficient lookup...")
+        flood_df = pd.read_csv(
+            self.flood_csv_path,
+            usecols=['DATE_BEGIN', 'DATE_END', 'LAT', 'LON'],
+            dtype=str,
+            encoding='latin1'
+        )
+        flood_df['DATE_BEGIN'] = flood_df['DATE_BEGIN'].astype(str).str.replace(r'\.0$', '', regex=True)
+        flood_df['DATE_END'] = flood_df['DATE_END'].astype(str).str.replace(r'\.0$', '', regex=True)
+        flood_df['begin_dates_dt'] = pd.to_datetime(flood_df['DATE_BEGIN'], format='%Y%m%d%H%M', errors='coerce')
+        flood_df['end_dates_dt'] = pd.to_datetime(flood_df['DATE_END'], format='%Y%m%d%H%M', errors='coerce')
+        valid_dates_mask = flood_df['begin_dates_dt'].notna() & flood_df['end_dates_dt'].notna()
+        preprocessed_flood_df = flood_df[valid_dates_mask].copy()
+
         # --- Parallel processing of daily graph data ---
         num_cores = min(cpu_count(), 16) # Cap at 16 cores to be reasonable
         print(f"Processing {self.len()} days of data using {num_cores} cores...")
@@ -211,7 +246,7 @@ class FloodDataset(Dataset):
         worker_func = partial(process_single_day, 
                               processed_dir=self.processed_dir,
                               wldas_files=self.wldas_files,
-                              flood_data_path=self.flood_csv_path,
+                              preprocessed_flood_df=preprocessed_flood_df,
                               agg_grid=agg_grid,
                               lat_min_us=lat_min_us, lat_max_us=lat_max_us,
                               lon_min_us=lon_min_us, lon_max_us=lon_max_us,
