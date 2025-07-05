@@ -14,7 +14,7 @@ from read_dem import process_dem_data
 
 # Helper function for parallel processing
 # It must be defined at the top level to be pickleable by multiprocessing
-def process_single_day(idx, processed_dir, wldas_files, preprocessed_flood_df, agg_grid, lat_min_us, lat_max_us, lon_min_us, lon_max_us, n_rows, n_cols, num_nodes, edge_index, edge_weight):
+def process_single_day(idx, processed_dir, wldas_files, floods_by_date, agg_grid, lat_min_us, lat_max_us, lon_min_us, lon_max_us, n_rows, n_cols, num_nodes, edge_index, edge_weight):
     try:
         # Recreate the necessary parts of the dataset object for one sample
         # This avoids pickling large objects
@@ -47,69 +47,51 @@ def process_single_day(idx, processed_dir, wldas_files, preprocessed_flood_df, a
         
         y = torch.zeros(num_nodes, dtype=torch.float)
         date_part = target_date_str.split('_')[-1]
-        target_date = pd.to_datetime(date_part, format='%Y%m%d')
+        target_date = pd.to_datetime(date_part, format='%Y%m%d').date()
 
-        daily_floods = preprocessed_flood_df[(preprocessed_flood_df['begin_dates_dt'].dt.date <= target_date.date()) & (preprocessed_flood_df['end_dates_dt'].dt.date >= target_date.date())]
+        daily_flood_coords = floods_by_date.get(target_date, [])
 
-        if not daily_floods.empty:
-            lats = pd.to_numeric(daily_floods['LAT'], errors='coerce')
-            lons = pd.to_numeric(daily_floods['LON'], errors='coerce')
+        if daily_flood_coords:
+            # --- Vectorized Smudging ---
+            # Work with a 2D numpy grid for easier spatial operations
+            y_grid = y.numpy().reshape(n_rows, n_cols)
+
+            # Pre-calculate the circular falloff patch once per day
+            radius = 5
+            patch_coords = np.arange(-radius, radius + 1)
+            dr_grid, dc_grid = np.meshgrid(patch_coords, patch_coords, indexing='ij')
+            distances = np.sqrt(dr_grid**2 + dc_grid**2)
+            smudge_patch = np.zeros_like(distances, dtype=np.float32)
+            circle_mask = distances <= radius
+            smudge_patch[circle_mask] = 1.0 - (distances[circle_mask] / radius)
+
+            for lat, lon in daily_flood_coords:
+                row_frac = (lat_max_us - lat) / (lat_max_us - lat_min_us)
+                col_frac = (lon - lon_min_us) / (lon_max_us - lon_min_us)
+                grid_row = int(row_frac * n_rows)
+                grid_col = int(col_frac * n_cols)
+
+                # Determine the slice of the main grid to update, clipping at boundaries
+                row_start = max(0, grid_row - radius)
+                row_end = min(n_rows, grid_row + radius + 1)
+                col_start = max(0, grid_col - radius)
+                col_end = min(n_cols, grid_col + radius + 1)
+                
+                # Determine the corresponding slice from the pre-calculated patch
+                patch_row_start = row_start - (grid_row - radius)
+                patch_row_end = patch_row_start + (row_end - row_start)
+                patch_col_start = col_start - (grid_col - radius)
+                patch_col_end = patch_col_start + (col_end - col_start)
+
+                # Get the slices
+                target_slice = y_grid[row_start:row_end, col_start:col_end]
+                patch_slice = smudge_patch[patch_row_start:patch_row_end, patch_col_start:patch_col_end]
+
+                # Apply the smudge using the maximum value to handle overlaps
+                y_grid[row_start:row_end, col_start:col_end] = np.maximum(target_slice, patch_slice)
             
-            valid_coords = lats.notna() & lons.notna()
-            if valid_coords.any():
-                lats = lats[valid_coords].to_numpy()
-                lons = lons[valid_coords].to_numpy()
-
-                row_fracs = (lat_max_us - lats) / (lat_max_us - lat_min_us)
-                col_fracs = (lons - lon_min_us) / (lon_max_us - lon_min_us)
-                
-                grid_rows = (row_fracs * n_rows).astype(int)
-                grid_cols = (col_fracs * n_cols).astype(int)
-
-                # Clamp values to be within bounds
-                grid_rows = np.clip(grid_rows, 0, n_rows - 1)
-                grid_cols = np.clip(grid_cols, 0, n_cols - 1)
-
-                # --- Smear the flood event with a weighted circular kernel ---
-                radius = 5
-                radius_sq = radius**2
-
-                # Pre-calculate kernel offsets and weights in NumPy
-                y_k, x_k = np.mgrid[-radius:radius+1, -radius:radius+1]
-                dist_sq = y_k**2 + x_k**2
-                mask = dist_sq <= radius_sq
-                
-                # Get kernel offsets for valid points within the circle
-                dy, dx = np.where(mask)
-                dy -= radius
-                dx -= radius
-
-                # Calculate weights with a linear falloff
-                weights = 1 - (np.sqrt(dist_sq[mask]) / radius)
-
-                # Convert kernel info to torch tensors for efficiency
-                # This is done once per day, outside the flood event loop
-                dy_t = torch.tensor(dy, dtype=torch.long)
-                dx_t = torch.tensor(dx, dtype=torch.long)
-                weights_t = torch.tensor(weights, dtype=torch.float)
-
-                # Iterate through each flood's center point
-                for r, c in zip(grid_rows, grid_cols):
-                    # Calculate neighbor coordinates by applying the kernel offsets
-                    nr, nc = r + dy_t, c + dx_t
-                    
-                    # Filter for neighbors that are within the grid bounds
-                    valid_mask = (nr >= 0) & (nr < n_rows) & (nc >= 0) & (nc < n_cols)
-                    nr_valid, nc_valid = nr[valid_mask], nc[valid_mask]
-                    weights_valid = weights_t[valid_mask]
-                    
-                    # Convert 2D coordinates to 1D node indices
-                    node_indices = nr_valid * n_cols + nc_valid
-                    
-                    if node_indices.numel() > 0:
-                        # Update the target 'y' tensor, taking the max weight if a cell
-                        # is affected by multiple overlapping flood circles.
-                        y[node_indices] = torch.maximum(y[node_indices], weights_valid)
+            # Convert the 2D numpy grid back to a 1D torch tensor
+            y = torch.from_numpy(y_grid.flatten())
 
         # --- Create and save Data object ---
         data = Data(
@@ -224,19 +206,30 @@ class FloodDataset(Dataset):
         print("Elevation grid and graph structure are ready.")
 
         # --- Pre-process flood data once ---
-        print("Preparing flood data for efficient lookup...")
+        print("Pre-processing flood data...")
         flood_df = pd.read_csv(
             self.flood_csv_path,
             usecols=['DATE_BEGIN', 'DATE_END', 'LAT', 'LON'],
-            dtype=str,
+            dtype={'LAT': str, 'LON': str},
             encoding='latin1'
         )
         flood_df['DATE_BEGIN'] = flood_df['DATE_BEGIN'].astype(str).str.replace(r'\.0$', '', regex=True)
         flood_df['DATE_END'] = flood_df['DATE_END'].astype(str).str.replace(r'\.0$', '', regex=True)
-        flood_df['begin_dates_dt'] = pd.to_datetime(flood_df['DATE_BEGIN'], format='%Y%m%d%H%M', errors='coerce')
-        flood_df['end_dates_dt'] = pd.to_datetime(flood_df['DATE_END'], format='%Y%m%d%H%M', errors='coerce')
-        valid_dates_mask = flood_df['begin_dates_dt'].notna() & flood_df['end_dates_dt'].notna()
-        preprocessed_flood_df = flood_df[valid_dates_mask].copy()
+        flood_df['begin'] = pd.to_datetime(flood_df['DATE_BEGIN'], format='%Y%m%d%H%M%S', errors='coerce')
+        flood_df['end'] = pd.to_datetime(flood_df['DATE_END'], format='%Y%m%d%H%M%S', errors='coerce')
+        flood_df['lat'] = pd.to_numeric(flood_df['LAT'], errors='coerce')
+        flood_df['lon'] = pd.to_numeric(flood_df['LON'], errors='coerce')
+
+        flood_df.dropna(subset=['begin', 'end', 'lat', 'lon'], inplace=True)
+
+        floods_by_date = {}
+        for _, row in tqdm(flood_df.iterrows(), total=len(flood_df), desc="Indexing flood events by day"):
+            for date in pd.date_range(row['begin'].date(), row['end'].date()):
+                d = date.date()
+                if d not in floods_by_date:
+                    floods_by_date[d] = []
+                floods_by_date[d].append((row['lat'], row['lon']))
+        print("Flood data pre-processing finished.")
 
         # --- Parallel processing of daily graph data ---
         num_cores = min(cpu_count(), 16) # Cap at 16 cores to be reasonable
@@ -246,7 +239,7 @@ class FloodDataset(Dataset):
         worker_func = partial(process_single_day, 
                               processed_dir=self.processed_dir,
                               wldas_files=self.wldas_files,
-                              preprocessed_flood_df=preprocessed_flood_df,
+                              floods_by_date=floods_by_date,
                               agg_grid=agg_grid,
                               lat_min_us=lat_min_us, lat_max_us=lat_max_us,
                               lon_min_us=lon_min_us, lon_max_us=lon_max_us,
