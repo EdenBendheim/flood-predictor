@@ -71,24 +71,34 @@ def process_single_day(idx, processed_dir, wldas_files, floods_by_date, agg_grid
                 grid_row = int(row_frac * n_rows)
                 grid_col = int(col_frac * n_cols)
 
-                # Determine the slice of the main grid to update, clipping at boundaries
-                row_start = max(0, grid_row - radius)
-                row_end = min(n_rows, grid_row + radius + 1)
-                col_start = max(0, grid_col - radius)
-                col_end = min(n_cols, grid_col + radius + 1)
-                
-                # Determine the corresponding slice from the pre-calculated patch
-                patch_row_start = row_start - (grid_row - radius)
-                patch_row_end = patch_row_start + (row_end - row_start)
-                patch_col_start = col_start - (grid_col - radius)
-                patch_col_end = patch_col_start + (col_end - col_start)
+                # Determine the slice of the main grid to update
+                row_start_raw = grid_row - radius
+                row_end_raw = grid_row + radius + 1
+                col_start_raw = grid_col - radius
+                col_end_raw = grid_col + radius + 1
+
+                # Clip the slice to the grid boundaries
+                row_start_clipped = max(0, row_start_raw)
+                row_end_clipped = min(n_rows, row_end_raw)
+                col_start_clipped = max(0, col_start_raw)
+                col_end_clipped = min(n_cols, col_end_raw)
+
+                # Based on the clipping, determine the slice of the patch to use
+                patch_row_start = row_start_clipped - row_start_raw
+                patch_row_end = patch_row_start + (row_end_clipped - row_start_clipped)
+                patch_col_start = col_start_clipped - col_start_raw
+                patch_col_end = patch_col_start + (col_end_clipped - col_start_clipped)
 
                 # Get the slices
-                target_slice = y_grid[row_start:row_end, col_start:col_end]
+                target_slice = y_grid[row_start_clipped:row_end_clipped, col_start_clipped:col_end_clipped]
                 patch_slice = smudge_patch[patch_row_start:patch_row_end, patch_col_start:patch_col_end]
 
-                # Apply the smudge using the maximum value to handle overlaps
-                y_grid[row_start:row_end, col_start:col_end] = np.maximum(target_slice, patch_slice)
+                # The shapes should now match perfectly. Apply the smudge.
+                if target_slice.shape == patch_slice.shape:
+                    y_grid[row_start_clipped:row_end_clipped, col_start_clipped:col_end_clipped] = np.maximum(target_slice, patch_slice)
+                # else:
+                    # This else block can be used for debugging if issues persist
+                    # print(f"Shape mismatch! Target: {target_slice.shape}, Patch: {patch_slice.shape}")
             
             # Convert the 2D numpy grid back to a 1D torch tensor
             y = torch.from_numpy(y_grid.flatten())
