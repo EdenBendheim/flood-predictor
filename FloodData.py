@@ -64,20 +64,32 @@ def process_single_day(idx, processed_dir, wldas_files, flood_data_path, agg_gri
         valid_dates_mask = begin_dates.notna() & end_dates.notna()
         daily_floods = flood_df[valid_dates_mask & (begin_dates.dt.date <= target_date.date()) & (end_dates.dt.date >= target_date.date())]
 
-        for _, row in daily_floods.iterrows():
-            lat = pd.to_numeric(row['LAT'], errors='coerce')
-            lon = pd.to_numeric(row['LON'], errors='coerce')
-            if pd.notna(lat) and pd.notna(lon):
-                row_frac = (lat_max_us - lat) / (lat_max_us - lat_min_us)
-                col_frac = (lon - lon_min_us) / (lon_max_us - lon_min_us)
-                grid_row = int(row_frac * n_rows)
-                grid_col = int(col_frac * n_cols)
-                grid_row = min(max(grid_row, 0), n_rows - 1)
-                grid_col = min(max(grid_col, 0), n_cols - 1)
+        if not daily_floods.empty:
+            lats = pd.to_numeric(daily_floods['LAT'], errors='coerce')
+            lons = pd.to_numeric(daily_floods['LON'], errors='coerce')
+            
+            valid_coords = lats.notna() & lons.notna()
+            if valid_coords.any():
+                lats = lats[valid_coords].to_numpy()
+                lons = lons[valid_coords].to_numpy()
+
+                row_fracs = (lat_max_us - lats) / (lat_max_us - lat_min_us)
+                col_fracs = (lons - lon_min_us) / (lon_max_us - lon_min_us)
                 
-                node_idx = grid_row * n_cols + grid_col
-                if 0 <= node_idx < num_nodes:
-                    y[node_idx] = 1
+                grid_rows = (row_fracs * n_rows).astype(np.int32)
+                grid_cols = (col_fracs * n_cols).astype(np.int32)
+
+                grid_rows = np.clip(grid_rows, 0, n_rows - 1)
+                grid_cols = np.clip(grid_cols, 0, n_cols - 1)
+                
+                node_indices = grid_rows * n_cols + grid_cols
+                
+                unique_indices = np.unique(node_indices)
+                valid_indices_mask = (unique_indices >= 0) & (unique_indices < num_nodes)
+                valid_indices = unique_indices[valid_indices_mask]
+                
+                if valid_indices.size > 0:
+                    y[valid_indices] = 1
 
         # --- Create and save Data object ---
         data = Data(
