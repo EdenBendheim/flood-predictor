@@ -278,8 +278,10 @@ def main(rank, world_size):
             
             scheduler.step()
             
-            # General cleanup for all processes
-            del all_preds, all_labels, day_data
+            # General cleanup for all processes, now robust against empty loops
+            del all_preds, all_labels
+            if 'day_data' in locals():
+                del day_data
             gc.collect()
             torch.cuda.empty_cache()
 
