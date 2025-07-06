@@ -123,6 +123,30 @@ def test_one_day(model, day_data, device, batch_size, num_neighbors, num_workers
     gc.collect()
     return avg_loss, day_preds, day_labels
 
+def prepare_data(rank, script_dir):
+    """
+    A separate function to run the expensive, one-time data processing.
+    This should be called once before the main training processes are spawned.
+    """
+    if rank == 0:
+        print("--- Preparing Training Data (Rank 0 only) ---")
+        _ = FloodDataset(
+            root=os.path.join(script_dir, 'data/flood_dataset_train_parallel'), 
+            wldas_dir=os.path.join(script_dir, 'WLDAS_2012'),
+            flood_csv=os.path.join(script_dir, 'USFD_v1.0.csv'),
+            mode='train'
+        )
+        print("--- Training Data Preparation Finished ---")
+
+        print("--- Preparing Test Data (Rank 0 only) ---")
+        _ = FloodDataset(
+            root=os.path.join(script_dir, 'data/flood_dataset_test_parallel'),
+            wldas_dir=os.path.join(script_dir, 'WLDAS_2012'),
+            flood_csv=os.path.join(script_dir, 'USFD_v1.0.csv'),
+            mode='test'
+        )
+        print("--- Test Data Preparation Finished ---")
+
 def main(rank, world_size):
     setup(rank, world_size)
     
@@ -142,6 +166,7 @@ def main(rank, world_size):
         num_workers_neighbor = 4
         
         # --- Dataset ---
+        # The data is now pre-processed. This instantiation will be fast.
         train_dataset = FloodDataset(
             root=os.path.join(script_dir, 'data/flood_dataset_train_parallel'), 
             wldas_dir=os.path.join(script_dir, 'WLDAS_2012'),
@@ -260,6 +285,11 @@ def main(rank, world_size):
 
             scheduler.step()
             
+            # Clean up after the epoch
+            del epoch_preds, epoch_labels
+            gc.collect()
+            torch.cuda.empty_cache()
+
         if rank == 0:
             print("Training finished.")
             
@@ -268,5 +298,15 @@ def main(rank, world_size):
 
 if __name__ == '__main__':
     world_size = torch.cuda.device_count()
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # --- Step 1: Prepare data in the main process ---
+    # This ensures the expensive processing is done only once.
+    print(f"--- Starting one-time data preparation on main process ---")
+    prepare_data(0, script_dir) # Use rank 0 to signify the main process
+    print(f"--- Data preparation complete ---")
+
+    # --- Step 2: Launch distributed training processes ---
+    print(f"--- Spawning {world_size} GPU processes for training ---")
     torch.multiprocessing.spawn(main, args=(world_size,), nprocs=world_size, join=True)
  
