@@ -66,7 +66,7 @@ def process_dem_data():
 
     full_dem[full_dem == -9999] = np.nan
 
-    block_size = 20
+    block_size = 11
     agg_n_rows = full_dem_height // block_size
     agg_n_cols = full_dem_width // block_size
     trimmed_dem = full_dem[:agg_n_rows * block_size, :agg_n_cols * block_size]
@@ -78,15 +78,33 @@ def process_dem_data():
         mean_grid = np.nanmean(dem_blocks, axis=(2, 3))
     
     mean_grid = np.nan_to_num(mean_grid, nan=0.0)
-    
-    # Define geographic boundaries, assuming 10m resolution and tile naming convention
-    # This might need adjustment depending on the exact DEM standard.
-    lat_max_us = unique_lats[0] + 5 
-    lon_min_us = unique_lons[0]
-    lat_min_us = unique_lats[-1]
-    lon_max_us = unique_lons[-1] + 5
 
-    return mean_grid, lat_min_us, lat_max_us, lon_min_us, lon_max_us
+    # The geographic boundaries of the full stitched DEM
+    full_dem_lat_max = unique_lats[0] + 5 
+    full_dem_lon_min = unique_lons[0]
+    full_dem_lat_min = unique_lats[-1]
+    full_dem_lon_max = unique_lons[-1] + 5
+
+    # Define the target WLDAS bounding box
+    wldas_lat_max, wldas_lat_min = 53.0, 25.0
+    wldas_lon_max, wldas_lon_min = -67.0, -125.0
+
+    # Convert WLDAS geographic coordinates to pixel coordinates on the full DEM grid
+    # Note: Latitude is inverted (0 is at the top)
+    y_res = (full_dem_lat_max - full_dem_lat_min) / mean_grid.shape[0]
+    x_res = (full_dem_lon_max - full_dem_lon_min) / mean_grid.shape[1]
+
+    wldas_px_top = int((full_dem_lat_max - wldas_lat_max) / y_res)
+    wldas_px_bottom = int((full_dem_lat_max - wldas_lat_min) / y_res)
+    wldas_px_left = int((wldas_lon_min - full_dem_lon_min) / x_res)
+    wldas_px_right = int((wldas_lon_max - full_dem_lon_min) / x_res)
+    
+    # Crop the aggregated grid to the WLDAS bounding box
+    print(f"Cropping DEM grid from {mean_grid.shape} to WLDAS box...")
+    cropped_grid = mean_grid[wldas_px_top:wldas_px_bottom, wldas_px_left:wldas_px_right]
+    print(f"Cropped DEM grid shape: {cropped_grid.shape}")
+
+    return cropped_grid, wldas_lat_min, wldas_lat_max, wldas_lon_min, wldas_lon_max
 
 if __name__ == "__main__":
     agg_grid, lat_min, lat_max, lon_min, lon_max = process_dem_data()
