@@ -19,6 +19,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import gc
+from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score
 
 from FloodData import FloodDataset
 from gcn_model import SpatioTemporalGCN
@@ -227,59 +228,82 @@ def main(rank, world_size):
             train_sampler.set_epoch(epoch)
             epoch_total_loss = 0
             
-            # Iterate over the robust day loader
-            for day_data in tqdm(train_day_loader, desc=f"Epoch {epoch+1}/{EPOCHS}", unit="day", total=len(train_sampler), disable=not sys.stdout.isatty()):
+            # Use tqdm only on rank 0 to avoid messy output
+            train_iterator = tqdm(train_day_loader, desc=f"Epoch {epoch+1}/{EPOCHS}", unit="day", total=len(train_day_loader), disable=(rank != 0))
+            for day_data in train_iterator:
                 day_loss = train_one_day(model, day_data, optimizer, device, BATCH_SIZE, NEIGHBOR_SAMPLES, scaler, num_workers_neighbor)
                 epoch_total_loss += day_loss
             
-            avg_epoch_loss = epoch_total_loss / len(train_sampler)
+            # Synchronize and gather loss from all processes
+            epoch_total_loss_tensor = torch.tensor(epoch_total_loss, device=device)
+            dist.all_reduce(epoch_total_loss_tensor, op=dist.ReduceOp.SUM)
             
+            # Note: len(train_day_loader) is the per-process length. Total length is len(train_dataset)
+            avg_epoch_loss = epoch_total_loss_tensor.item() / len(train_dataset)
+            
+            if rank == 0:
+                print(f"Epoch {epoch+1}/{EPOCHS} - Average Training Loss: {avg_epoch_loss:.4f}")
+
             # --- Validation Phase ---
             model.eval()
-            all_preds, all_labels = [], []
+            local_preds, local_labels = [], []
             total_test_loss = 0
             
             test_sampler.set_epoch(epoch) # Ensure validation set is shuffled consistently
-            for day_data in tqdm(test_day_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Test]", disable=(rank != 0)):
+            test_iterator = tqdm(test_day_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Test]", total=len(test_day_loader), disable=(rank != 0))
+            for day_data in test_iterator:
                 test_loss, preds, labels = test_one_day(model.module, day_data, device, BATCH_SIZE, NEIGHBOR_SAMPLES, num_workers_neighbor)
                 if test_loss is not None:
                     total_test_loss += test_loss
                 if preds is not None and labels is not None:
-                    all_preds.append(preds)
-                    all_labels.append(labels)
+                    local_preds.append(preds)
+                    local_labels.append(labels)
             
-            # --- Gather and Evaluate ---
+            # --- Gather and Evaluate (Corrected for DDP) ---
+            # 1. Gather results from all processes. Move to CPU before gathering.
+            local_preds_tensor = torch.cat(local_preds) if local_preds else torch.empty(0, dtype=torch.long)
+            local_labels_tensor = torch.cat(local_labels) if local_labels else torch.empty(0, dtype=torch.long)
+            
+            gathered_preds_tensors = [None] * world_size
+            gathered_labels_tensors = [None] * world_size
+            dist.all_gather_object(gathered_preds_tensors, local_preds_tensor)
+            dist.all_gather_object(gathered_labels_tensors, local_labels_tensor)
+
             if rank == 0:
-                if all_preds and all_labels:
-                    epoch_preds = torch.cat(all_preds)
-                    epoch_labels = torch.cat(all_labels)
-                    
-                    f1 = f1_score(epoch_labels.numpy(), epoch_preds.numpy())
+                # 2. Process gathered results on rank 0
+                epoch_preds = torch.cat([t for t in gathered_preds_tensors if t.numel() > 0])
+                epoch_labels = torch.cat([t for t in gathered_labels_tensors if t.numel() > 0])
+                
+                if epoch_preds.numel() > 0 and epoch_labels.numel() > 0:
+                    f1 = f1_score(epoch_labels.numpy(), epoch_preds.numpy(), zero_division=0)
                     accuracy = accuracy_score(epoch_labels.numpy(), epoch_preds.numpy())
-                    precision = precision_score(epoch_labels.numpy(), epoch_preds.numpy())
-                    recall = recall_score(epoch_labels.numpy(), epoch_preds.numpy())
+                    precision = precision_score(epoch_labels.numpy(), epoch_preds.numpy(), zero_division=0)
+                    recall = recall_score(epoch_labels.numpy(), epoch_preds.numpy(), zero_division=0)
                     
                     print(f"Epoch {epoch+1} Test Metrics: F1={f1:.4f}, Acc={accuracy:.4f}, Prec={precision:.4f}, Recall={recall:.4f}")
 
                     if f1 > best_f1_score:
                         best_f1_score = f1
                         model_save_path = os.path.join(script_dir, "saved_models", "best_model.pt")
+                        os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
                         torch.save(model.module.state_dict(), model_save_path)
                         print(f"New best model saved with F1 score: {f1:.4f}")
+                else:
+                    print("No predictions were generated during validation, skipping metrics.")
                 
-                # Cleanup moved inside the rank 0 block
+                # Cleanup rank-0 specific tensors
                 if 'epoch_preds' in locals():
                     del epoch_preds
                 if 'epoch_labels' in locals():
                     del epoch_labels
-
-            # Synchronize processes before the next epoch
+            
+            # Synchronize all processes before starting the next epoch.
             dist.barrier()
             
             scheduler.step()
             
-            # General cleanup for all processes, now robust against empty loops
-            del all_preds, all_labels
+            # General cleanup for all processes
+            del local_preds, local_labels, gathered_preds_tensors, gathered_labels_tensors
             if 'day_data' in locals():
                 del day_data
             gc.collect()
