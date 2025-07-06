@@ -223,70 +223,63 @@ def main(rank, world_size):
         best_f1_score = 0.0
 
         # --- Training Loop ---
-        for epoch in range(1, EPOCHS + 1):
+        for epoch in range(EPOCHS):
             train_sampler.set_epoch(epoch)
             epoch_total_loss = 0
             
             # Iterate over the robust day loader
-            for day_data in tqdm(train_day_loader, desc=f"Epoch {epoch:02d}", unit="day", total=len(train_sampler), disable=not sys.stdout.isatty()):
+            for day_data in tqdm(train_day_loader, desc=f"Epoch {epoch+1}/{EPOCHS}", unit="day", total=len(train_sampler), disable=not sys.stdout.isatty()):
                 day_loss = train_one_day(model, day_data, optimizer, device, BATCH_SIZE, NEIGHBOR_SAMPLES, scaler, num_workers_neighbor)
                 epoch_total_loss += day_loss
             
             avg_epoch_loss = epoch_total_loss / len(train_sampler)
             
-            # --- Evaluation Step (on rank 0) ---
+            # --- Validation Phase ---
+            model.eval()
+            all_preds, all_labels = [], []
+            total_test_loss = 0
+            
+            test_sampler.set_epoch(epoch) # Ensure validation set is shuffled consistently
+            for day_data in tqdm(test_day_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Test]", disable=(rank != 0)):
+                test_loss, preds, labels = test_one_day(model.module, day_data, device, BATCH_SIZE, NEIGHBOR_SAMPLES, num_workers_neighbor)
+                if test_loss is not None:
+                    total_test_loss += test_loss
+                if preds is not None and labels is not None:
+                    all_preds.append(preds)
+                    all_labels.append(labels)
+            
+            # --- Gather and Evaluate ---
             if rank == 0:
-                test_total_loss = 0
-                epoch_preds, epoch_labels = [], []
-                
-                for day_data in tqdm(test_day_loader, desc=f"Epoch {epoch:02d} (Test)", unit="day", total=len(test_sampler), disable=not sys.stdout.isatty()):
-                    day_loss, day_preds, day_labels = test_one_day(model.module, day_data, device, BATCH_SIZE, NEIGHBOR_SAMPLES, num_workers_neighbor)
-                    test_total_loss += day_loss
-                    if day_preds.numel() > 0:
-                        epoch_preds.append(day_preds)
-                        epoch_labels.append(day_labels)
-                
-                avg_test_loss = test_total_loss / len(test_sampler)
-                print(f'Epoch: {epoch:02d}, Avg Train Loss: {avg_epoch_loss:.4f}, Avg Test Loss: {avg_test_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}')
-                
-                if epoch_preds and epoch_labels:
-                    all_preds = torch.cat(epoch_preds)
-                    all_labels = torch.cat(epoch_labels).long()
+                if all_preds and all_labels:
+                    epoch_preds = torch.cat(all_preds)
+                    epoch_labels = torch.cat(all_labels)
                     
-                    # Calculate metrics
-                    tp = ((all_preds == 1) & (all_labels == 1)).sum().item()
-                    fp = ((all_preds == 1) & (all_labels == 0)).sum().item()
-                    fn = ((all_preds == 0) & (all_labels == 1)).sum().item()
-                    tn = ((all_preds == 0) & (all_labels == 0)).sum().item()
+                    f1 = f1_score(epoch_labels.numpy(), epoch_preds.numpy())
+                    accuracy = accuracy_score(epoch_labels.numpy(), epoch_preds.numpy())
+                    precision = precision_score(epoch_labels.numpy(), epoch_preds.numpy())
+                    recall = recall_score(epoch_labels.numpy(), epoch_preds.numpy())
                     
-                    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-                    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-                    f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-                    accuracy = (tp + tn) / (tp + tn + fp + fn)
+                    print(f"Epoch {epoch+1} Test Metrics: F1={f1:.4f}, Acc={accuracy:.4f}, Prec={precision:.4f}, Recall={recall:.4f}")
 
-                    print(f'  Test Metrics: Accuracy: {accuracy:.4f} | F1-Score: {f1_score:.4f}')
-                    print(f'    > Precision: {precision:.4f} | Recall: {recall:.4f}')
-                    print(f'    > Missed Floods (FN): {fn} | False Alarms (FP): {fp}')
-
-                # --- Save Model Checkpoints ---
-                save_dir = os.path.join(script_dir, 'saved_models')
-                os.makedirs(save_dir, exist_ok=True)
+                    if f1 > best_f1_score:
+                        best_f1_score = f1
+                        model_save_path = os.path.join(script_dir, "saved_models", "best_model.pt")
+                        torch.save(model.module.state_dict(), model_save_path)
+                        print(f"New best model saved with F1 score: {f1:.4f}")
                 
-                # Save the latest model
-                latest_save_path = os.path.join(save_dir, f'flood_predictor_epoch_{epoch}.pth')
-                torch.save(model.module.state_dict(), latest_save_path)
-                
-                # Save the best model if F1 score has improved
-                if f1_score > best_f1_score:
-                    best_f1_score = f1_score
-                    best_save_path = os.path.join(save_dir, 'best_flood_predictor.pth')
-                    torch.save(model.module.state_dict(), best_save_path)
-                    print(f'New best model saved to {best_save_path} (F1-Score: {best_f1_score:.4f})')
+                # Cleanup moved inside the rank 0 block
+                if 'epoch_preds' in locals():
+                    del epoch_preds
+                if 'epoch_labels' in locals():
+                    del epoch_labels
 
+            # Synchronize processes before the next epoch
+            dist.barrier()
+            
             scheduler.step()
             
-            # Clean up after the epoch
-            del epoch_preds, epoch_labels
+            # General cleanup for all processes
+            del all_preds, all_labels, day_data
             gc.collect()
             torch.cuda.empty_cache()
 
