@@ -19,7 +19,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import gc
-from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score
 
 from FloodData import FloodDataset
 from gcn_model import SpatioTemporalGCN
@@ -124,30 +123,6 @@ def test_one_day(model, day_data, device, batch_size, num_neighbors, num_workers
     gc.collect()
     return avg_loss, day_preds, day_labels
 
-def prepare_data(rank, script_dir):
-    """
-    A separate function to run the expensive, one-time data processing.
-    This should be called once before the main training processes are spawned.
-    """
-    if rank == 0:
-        print("--- Preparing Training Data (Rank 0 only) ---")
-        _ = FloodDataset(
-            root=os.path.join(script_dir, 'data/flood_dataset_train_parallel'), 
-            wldas_dir=os.path.join(script_dir, 'WLDAS_2012'),
-            flood_csv=os.path.join(script_dir, 'USFD_v1.0.csv'),
-            mode='train'
-        )
-        print("--- Training Data Preparation Finished ---")
-
-        print("--- Preparing Test Data (Rank 0 only) ---")
-        _ = FloodDataset(
-            root=os.path.join(script_dir, 'data/flood_dataset_test_parallel'),
-            wldas_dir=os.path.join(script_dir, 'WLDAS_2012'),
-            flood_csv=os.path.join(script_dir, 'USFD_v1.0.csv'),
-            mode='test'
-        )
-        print("--- Test Data Preparation Finished ---")
-
 def main(rank, world_size):
     setup(rank, world_size)
     
@@ -157,7 +132,7 @@ def main(rank, world_size):
         LEARNING_RATE = 0.001 * world_size # Scale learning rate
         HIDDEN_DIM = 256 # Increased model capacity
         GCN_LAYERS = 8
-        BATCH_SIZE = 256000 # Reduced batch size to prevent CUDA errors with a larger model
+        BATCH_SIZE = 2048000 # Reduced batch size to prevent CUDA errors with a larger model
         NEIGHBOR_SAMPLES = [15, 10, 5, 5, 5, 5, 5, 5] # Deeper neighborhood sampling for 4 GCN layers
         
         # --- Setup ---
@@ -167,7 +142,6 @@ def main(rank, world_size):
         num_workers_neighbor = 4
         
         # --- Dataset ---
-        # The data is now pre-processed. This instantiation will be fast.
         train_dataset = FloodDataset(
             root=os.path.join(script_dir, 'data/flood_dataset_train_parallel'), 
             wldas_dir=os.path.join(script_dir, 'WLDAS_2012'),
@@ -190,7 +164,7 @@ def main(rank, world_size):
             train_dataset,
             sampler=train_sampler,
             batch_size=None,  # Important: yields one day_data at a time
-            num_workers=2, # A few persistent workers to load day files
+            num_workers=world_size * 2, # A few persistent workers to load day files
             prefetch_factor=2,
             persistent_workers=True,
         )
@@ -198,7 +172,7 @@ def main(rank, world_size):
             test_dataset,
             sampler=test_sampler,
             batch_size=None,
-            num_workers=2,
+            num_workers=world_size * 2,
             prefetch_factor=2,
             persistent_workers=True,
         )
@@ -224,91 +198,68 @@ def main(rank, world_size):
         best_f1_score = 0.0
 
         # --- Training Loop ---
-        for epoch in range(EPOCHS):
+        for epoch in range(1, EPOCHS + 1):
             train_sampler.set_epoch(epoch)
             epoch_total_loss = 0
             
-            # Use tqdm only on rank 0 to avoid messy output
-            train_iterator = tqdm(train_day_loader, desc=f"Epoch {epoch+1}/{EPOCHS}", unit="day", total=len(train_day_loader), disable=(rank != 0))
-            for day_data in train_iterator:
+            # Iterate over the robust day loader
+            for day_data in tqdm(train_day_loader, desc=f"Epoch {epoch:02d}", unit="day", total=len(train_sampler), disable=not sys.stdout.isatty()):
                 day_loss = train_one_day(model, day_data, optimizer, device, BATCH_SIZE, NEIGHBOR_SAMPLES, scaler, num_workers_neighbor)
                 epoch_total_loss += day_loss
             
-            # Synchronize and gather loss from all processes
-            epoch_total_loss_tensor = torch.tensor(epoch_total_loss, device=device)
-            dist.all_reduce(epoch_total_loss_tensor, op=dist.ReduceOp.SUM)
+            avg_epoch_loss = epoch_total_loss / len(train_sampler)
             
-            # Note: len(train_day_loader) is the per-process length. Total length is len(train_dataset)
-            avg_epoch_loss = epoch_total_loss_tensor.item() / len(train_dataset)
-            
+            # --- Evaluation Step (on rank 0) ---
             if rank == 0:
-                print(f"Epoch {epoch+1}/{EPOCHS} - Average Training Loss: {avg_epoch_loss:.4f}")
-
-            # --- Validation Phase ---
-            model.eval()
-            local_preds, local_labels = [], []
-            total_test_loss = 0
-            
-            test_sampler.set_epoch(epoch) # Ensure validation set is shuffled consistently
-            test_iterator = tqdm(test_day_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Test]", total=len(test_day_loader), disable=(rank != 0))
-            for day_data in test_iterator:
-                test_loss, preds, labels = test_one_day(model.module, day_data, device, BATCH_SIZE, NEIGHBOR_SAMPLES, num_workers_neighbor)
-                if test_loss is not None:
-                    total_test_loss += test_loss
-                if preds is not None and labels is not None:
-                    local_preds.append(preds)
-                    local_labels.append(labels)
-            
-            # --- Gather and Evaluate (Corrected for DDP) ---
-            # 1. Gather results from all processes. Move to CPU before gathering.
-            local_preds_tensor = torch.cat(local_preds) if local_preds else torch.empty(0, dtype=torch.long)
-            local_labels_tensor = torch.cat(local_labels) if local_labels else torch.empty(0, dtype=torch.long)
-            
-            gathered_preds_tensors = [None] * world_size
-            gathered_labels_tensors = [None] * world_size
-            dist.all_gather_object(gathered_preds_tensors, local_preds_tensor)
-            dist.all_gather_object(gathered_labels_tensors, local_labels_tensor)
-
-            if rank == 0:
-                # 2. Process gathered results on rank 0
-                epoch_preds = torch.cat([t for t in gathered_preds_tensors if t.numel() > 0])
-                epoch_labels = torch.cat([t for t in gathered_labels_tensors if t.numel() > 0])
+                test_total_loss = 0
+                epoch_preds, epoch_labels = [], []
                 
-                if epoch_preds.numel() > 0 and epoch_labels.numel() > 0:
-                    f1 = f1_score(epoch_labels.numpy(), epoch_preds.numpy(), zero_division=0)
-                    accuracy = accuracy_score(epoch_labels.numpy(), epoch_preds.numpy())
-                    precision = precision_score(epoch_labels.numpy(), epoch_preds.numpy(), zero_division=0)
-                    recall = recall_score(epoch_labels.numpy(), epoch_preds.numpy(), zero_division=0)
+                for day_data in tqdm(test_day_loader, desc=f"Epoch {epoch:02d} (Test)", unit="day", total=len(test_sampler), disable=not sys.stdout.isatty()):
+                    day_loss, day_preds, day_labels = test_one_day(model.module, day_data, device, BATCH_SIZE, NEIGHBOR_SAMPLES, num_workers_neighbor)
+                    test_total_loss += day_loss
+                    if day_preds.numel() > 0:
+                        epoch_preds.append(day_preds)
+                        epoch_labels.append(day_labels)
+                
+                avg_test_loss = test_total_loss / len(test_sampler)
+                print(f'Epoch: {epoch:02d}, Avg Train Loss: {avg_epoch_loss:.4f}, Avg Test Loss: {avg_test_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}')
+                
+                if epoch_preds and epoch_labels:
+                    all_preds = torch.cat(epoch_preds)
+                    all_labels = torch.cat(epoch_labels).long()
                     
-                    print(f"Epoch {epoch+1} Test Metrics: F1={f1:.4f}, Acc={accuracy:.4f}, Prec={precision:.4f}, Recall={recall:.4f}")
+                    # Calculate metrics
+                    tp = ((all_preds == 1) & (all_labels == 1)).sum().item()
+                    fp = ((all_preds == 1) & (all_labels == 0)).sum().item()
+                    fn = ((all_preds == 0) & (all_labels == 1)).sum().item()
+                    tn = ((all_preds == 0) & (all_labels == 0)).sum().item()
+                    
+                    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                    f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+                    accuracy = (tp + tn) / (tp + tn + fp + fn)
 
-                    if f1 > best_f1_score:
-                        best_f1_score = f1
-                        model_save_path = os.path.join(script_dir, "saved_models", "best_model.pt")
-                        os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
-                        torch.save(model.module.state_dict(), model_save_path)
-                        print(f"New best model saved with F1 score: {f1:.4f}")
-                else:
-                    print("No predictions were generated during validation, skipping metrics.")
+                    print(f'  Test Metrics: Accuracy: {accuracy:.4f} | F1-Score: {f1_score:.4f}')
+                    print(f'    > Precision: {precision:.4f} | Recall: {recall:.4f}')
+                    print(f'    > Missed Floods (FN): {fn} | False Alarms (FP): {fp}')
+
+                # --- Save Model Checkpoints ---
+                save_dir = os.path.join(script_dir, 'saved_models')
+                os.makedirs(save_dir, exist_ok=True)
                 
-                # Cleanup rank-0 specific tensors
-                if 'epoch_preds' in locals():
-                    del epoch_preds
-                if 'epoch_labels' in locals():
-                    del epoch_labels
-            
-            # Synchronize all processes before starting the next epoch.
-            dist.barrier()
-            
+                # Save the latest model
+                latest_save_path = os.path.join(save_dir, f'flood_predictor_epoch_{epoch}.pth')
+                torch.save(model.module.state_dict(), latest_save_path)
+                
+                # Save the best model if F1 score has improved
+                if f1_score > best_f1_score:
+                    best_f1_score = f1_score
+                    best_save_path = os.path.join(save_dir, 'best_flood_predictor.pth')
+                    torch.save(model.module.state_dict(), best_save_path)
+                    print(f'New best model saved to {best_save_path} (F1-Score: {best_f1_score:.4f})')
+
             scheduler.step()
             
-            # General cleanup for all processes
-            del local_preds, local_labels, gathered_preds_tensors, gathered_labels_tensors
-            if 'day_data' in locals():
-                del day_data
-            gc.collect()
-            torch.cuda.empty_cache()
-
         if rank == 0:
             print("Training finished.")
             
@@ -317,15 +268,5 @@ def main(rank, world_size):
 
 if __name__ == '__main__':
     world_size = torch.cuda.device_count()
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-
-    # --- Step 1: Prepare data in the main process ---
-    # This ensures the expensive processing is done only once.
-    print(f"--- Starting one-time data preparation on main process ---")
-    prepare_data(0, script_dir) # Use rank 0 to signify the main process
-    print(f"--- Data preparation complete ---")
-
-    # --- Step 2: Launch distributed training processes ---
-    print(f"--- Spawning {world_size} GPU processes for training ---")
     torch.multiprocessing.spawn(main, args=(world_size,), nprocs=world_size, join=True)
  

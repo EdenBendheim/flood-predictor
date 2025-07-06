@@ -14,12 +14,8 @@ from read_dem import process_dem_data
 
 # Helper function for parallel processing
 # It must be defined at the top level to be pickleable by multiprocessing
-def process_single_day(idx, processed_dir, wldas_files, floods_by_date, agg_grid, n_rows, n_cols, num_nodes, edge_index, edge_weight):
+def process_single_day(idx, processed_dir, wldas_files, floods_by_date, agg_grid, lat_min_us, lat_max_us, lon_min_us, lon_max_us, n_rows, n_cols, num_nodes, edge_index, edge_weight):
     try:
-        # Define the cannonical WLDAS boundaries here
-        lat_min_us, lat_max_us = 25.0, 53.0
-        lon_min_us, lon_max_us = -125.0, -67.0
-        
         # Recreate the necessary parts of the dataset object for one sample
         # This avoids pickling large objects
         
@@ -125,11 +121,10 @@ def process_single_day(idx, processed_dir, wldas_files, floods_by_date, agg_grid
 
 
 class FloodDataset(Dataset):
-    def __init__(self, root, wldas_dir, flood_csv, transform=None, pre_transform=None, mode='train', train_test_split=0.8, num_workers=8):
+    def __init__(self, root, wldas_dir, flood_csv, transform=None, pre_transform=None, mode='train', train_test_split=0.8):
         self.wldas_dir = wldas_dir
         self.flood_csv_path = flood_csv
         self.mode = mode
-        self.num_workers = num_workers
         
         all_wldas_files = sorted([os.path.join(self.wldas_dir, f) for f in os.listdir(self.wldas_dir) if f.endswith('.nc')])
         
@@ -247,7 +242,7 @@ class FloodDataset(Dataset):
         print("Flood data pre-processing finished.")
 
         # --- Parallel processing of daily graph data ---
-        num_cores = min(cpu_count(), self.num_workers) # Cap at the specified number of workers
+        num_cores = min(cpu_count(), 16) # Cap at 16 cores to be reasonable
         print(f"Processing {self.len()} days of data using {num_cores} cores...")
 
         # Use functools.partial to pre-fill arguments for the worker function
@@ -256,6 +251,8 @@ class FloodDataset(Dataset):
                               wldas_files=self.wldas_files,
                               floods_by_date=floods_by_date,
                               agg_grid=agg_grid,
+                              lat_min_us=lat_min_us, lat_max_us=lat_max_us,
+                              lon_min_us=lon_min_us, lon_max_us=lon_max_us,
                               n_rows=n_rows, n_cols=n_cols,
                               num_nodes=num_nodes,
                               edge_index=edge_index,
@@ -288,8 +285,7 @@ if __name__ == '__main__':
         root='./data/flood_dataset_test_parallel', # Use a new root to trigger processing
         wldas_dir='WLDAS_2012',
         flood_csv='USFD_v1.0.csv',
-        mode='test', # Use a smaller dataset for testing
-        num_workers=4 # Example: Override the default number of workers
+        mode='test' # Use a smaller dataset for testing
     )
 
     print(f"Dataset size: {len(dataset)}")
