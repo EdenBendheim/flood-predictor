@@ -156,7 +156,7 @@ def main(rank, world_size):
         LEARNING_RATE = 0.001 * world_size # Scale learning rate
         HIDDEN_DIM = 256 # Increased model capacity
         GCN_LAYERS = 8
-        BATCH_SIZE = 2048000 # Reduced batch size to prevent CUDA errors with a larger model
+        BATCH_SIZE = 256000 # Reduced batch size to prevent CUDA errors with a larger model
         NEIGHBOR_SAMPLES = [15, 10, 5, 5, 5, 5, 5, 5] # Deeper neighborhood sampling for 4 GCN layers
         
         # --- Setup ---
@@ -189,7 +189,7 @@ def main(rank, world_size):
             train_dataset,
             sampler=train_sampler,
             batch_size=None,  # Important: yields one day_data at a time
-            num_workers=world_size * 2, # A few persistent workers to load day files
+            num_workers=2, # A few persistent workers to load day files
             prefetch_factor=2,
             persistent_workers=True,
         )
@@ -197,7 +197,7 @@ def main(rank, world_size):
             test_dataset,
             sampler=test_sampler,
             batch_size=None,
-            num_workers=world_size * 2,
+            num_workers=2,
             prefetch_factor=2,
             persistent_workers=True,
         )
