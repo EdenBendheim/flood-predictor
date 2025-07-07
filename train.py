@@ -91,7 +91,7 @@ def train_one_day(model, day_data, optimizer, device, batch_size, num_neighbors,
         
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5) # More stable clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
         
@@ -156,7 +156,7 @@ def main(rank, world_size):
         LEARNING_RATE = 0.001 * world_size # Scale learning rate
         HIDDEN_DIM = 256 # Increased model capacity
         GCN_LAYERS = 8
-        BATCH_SIZE = 128000 # Reduced batch size for stability
+        BATCH_SIZE = 256000 # Reduced batch size to prevent CUDA errors with a larger model
         NEIGHBOR_SAMPLES = [15, 10, 5, 5, 5, 5, 5, 5] # Deeper neighborhood sampling for 4 GCN layers
         
         # --- Setup ---
