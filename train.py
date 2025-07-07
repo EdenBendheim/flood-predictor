@@ -61,17 +61,37 @@ def train_one_day(model, day_data, optimizer, device, batch_size, num_neighbors,
         
         with torch.amp.autocast(device_type=device.type):
             out = model(batch)
+            
+            # Debug: Check for NaN/Inf in model output
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                print(f"WARNING: NaN or Inf detected in model output!")
+                
+            # Debug: Check for NaN/Inf in targets
+            if torch.isnan(batch.y).any() or torch.isinf(batch.y).any():
+                print(f"WARNING: NaN or Inf detected in targets!")
+            
             num_positives = batch.y.sum()
             num_negatives = len(batch.y) - num_positives
             pos_weight = num_negatives / num_positives if num_positives > 0 else torch.tensor(1.0, device=device)
+            
+            # Debug: Check pos_weight calculation
+            if torch.isnan(pos_weight) or torch.isinf(pos_weight):
+                print(f"WARNING: Invalid pos_weight! num_positives={num_positives}, num_negatives={num_negatives}")
+                pos_weight = torch.tensor(1.0, device=device)
+            
             # Clamp the pos_weight to a reasonable value to prevent loss from becoming nan/inf
             pos_weight = torch.clamp(pos_weight, min=1.0, max=10000.0)
             criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
             loss = criterion(out, batch.y)
+            
+            # Debug: Check loss value
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"CRITICAL: NaN or Inf loss detected! Skipping batch.")
+                continue
         
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5) # More stable clipping
         scaler.step(optimizer)
         scaler.update()
         
@@ -99,7 +119,7 @@ def test_one_day(model, day_data, device, batch_size, num_neighbors, num_workers
 
     total_loss = 0
     num_batches = 0
-    day_preds, day_labels = [], []
+    day_preds, day_labels, day_probs = [], [], []
     for batch in tqdm(loader, desc="Day's Batches (Test)", leave=False, disable=not sys.stdout.isatty()):
         batch = batch.to(device)
         with torch.amp.autocast(device_type=device.type):
@@ -109,19 +129,23 @@ def test_one_day(model, day_data, device, batch_size, num_neighbors, num_workers
         
         total_loss += loss.item()
         num_batches += 1
-        preds = (out.sigmoid() > 0.5).long()
+        
+        probs = out.sigmoid()
+        preds = (probs > 0.5).long()
         day_preds.append(preds.cpu())
         day_labels.append(batch.y.cpu())
+        day_probs.append(probs.cpu())
         
     avg_loss = total_loss / num_batches if num_batches > 0 else 0
     if day_preds and day_labels:
         day_preds = torch.cat(day_preds, dim=0)
         day_labels = torch.cat(day_labels, dim=0)
+        day_probs = torch.cat(day_probs, dim=0)
     
     # Explicitly clean up to free resources from the NeighborLoader
     del loader
     gc.collect()
-    return avg_loss, day_preds, day_labels
+    return avg_loss, day_preds, day_labels, day_probs
 
 def main(rank, world_size):
     setup(rank, world_size)
@@ -132,7 +156,7 @@ def main(rank, world_size):
         LEARNING_RATE = 0.001 * world_size # Scale learning rate
         HIDDEN_DIM = 256 # Increased model capacity
         GCN_LAYERS = 8
-        BATCH_SIZE = 256000 # Reduced batch size to prevent CUDA errors with a larger model
+        BATCH_SIZE = 128000 # Reduced batch size for stability
         NEIGHBOR_SAMPLES = [15, 10, 5, 5, 5, 5, 5, 5] # Deeper neighborhood sampling for 4 GCN layers
         
         # --- Setup ---
@@ -165,7 +189,7 @@ def main(rank, world_size):
             sampler=train_sampler,
             batch_size=None,  # Important: yields one day_data at a time
             num_workers=2, # A few persistent workers to load day files
-            prefetch_factor=1,
+            prefetch_factor=2,
             persistent_workers=True,
         )
         test_day_loader = DataLoader(
@@ -173,7 +197,7 @@ def main(rank, world_size):
             sampler=test_sampler,
             batch_size=None,
             num_workers=2,
-            prefetch_factor=1,
+            prefetch_factor=2,
             persistent_workers=True,
         )
 
@@ -212,34 +236,42 @@ def main(rank, world_size):
             # --- Evaluation Step (on rank 0) ---
             if rank == 0:
                 test_total_loss = 0
-                epoch_preds, epoch_labels = [], []
+                epoch_preds, epoch_labels, epoch_probs = [], [], []
                 
                 for day_data in tqdm(test_day_loader, desc=f"Epoch {epoch:02d} (Test)", unit="day", total=len(test_sampler), disable=not sys.stdout.isatty()):
-                    day_loss, day_preds, day_labels = test_one_day(model.module, day_data, device, BATCH_SIZE, NEIGHBOR_SAMPLES, num_workers_neighbor)
+                    day_loss, day_preds, day_labels, day_probs = test_one_day(model.module, day_data, device, BATCH_SIZE, NEIGHBOR_SAMPLES, num_workers_neighbor)
                     test_total_loss += day_loss
                     if day_preds.numel() > 0:
                         epoch_preds.append(day_preds)
                         epoch_labels.append(day_labels)
+                        epoch_probs.append(day_probs)
                 
                 avg_test_loss = test_total_loss / len(test_sampler)
                 print(f'Epoch: {epoch:02d}, Avg Train Loss: {avg_epoch_loss:.4f}, Avg Test Loss: {avg_test_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}')
                 
                 if epoch_preds and epoch_labels:
                     all_preds = torch.cat(epoch_preds)
-                    all_labels = torch.cat(epoch_labels).long()
+                    all_labels_float = torch.cat(epoch_labels)
+                    all_probs = torch.cat(epoch_probs)
+                    
+                    # --- New Metric: Mean Absolute Error on smudged labels ---
+                    smudge_mae = torch.nn.functional.l1_loss(all_probs, all_labels_float).item()
+                    
+                    # --- Original Binary Metrics ---
+                    all_labels_binary = all_labels_float.long()
                     
                     # Calculate metrics
-                    tp = ((all_preds == 1) & (all_labels == 1)).sum().item()
-                    fp = ((all_preds == 1) & (all_labels == 0)).sum().item()
-                    fn = ((all_preds == 0) & (all_labels == 1)).sum().item()
-                    tn = ((all_preds == 0) & (all_labels == 0)).sum().item()
+                    tp = ((all_preds == 1) & (all_labels_binary == 1)).sum().item()
+                    fp = ((all_preds == 1) & (all_labels_binary == 0)).sum().item()
+                    fn = ((all_preds == 0) & (all_labels_binary == 1)).sum().item()
+                    tn = ((all_preds == 0) & (all_labels_binary == 0)).sum().item()
                     
                     precision = tp / (tp + fp) if (tp + fp) > 0 else 0
                     recall = tp / (tp + fn) if (tp + fn) > 0 else 0
                     f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
                     accuracy = (tp + tn) / (tp + tn + fp + fn)
 
-                    print(f'  Test Metrics: Accuracy: {accuracy:.4f} | F1-Score: {f1_score:.4f}')
+                    print(f'  Test Metrics: Accuracy: {accuracy:.4f} | F1-Score: {f1_score:.4f} | Smudge MAE: {smudge_mae:.4f}')
                     print(f'    > Precision: {precision:.4f} | Recall: {recall:.4f}')
                     print(f'    > Missed Floods (FN): {fn} | False Alarms (FP): {fp}')
 
