@@ -273,7 +273,8 @@ def main(rank, world_size):
 
                     print(f'  Test Metrics: Accuracy: {accuracy:.4f} | F1-Score: {f1_score:.4f} | Smudge MAE: {smudge_mae:.4f}')
                     print(f'    > Precision: {precision:.4f} | Recall: {recall:.4f}')
-                    print(f'    > Missed Floods (FN): {fn} | False Alarms (FP): {fp}')
+                    total_predicted_floods = tp + fp
+                    print(f'    > Missed Floods (FN): {fn} | False Alarms (FP): {fp} | Total Predicted Floods: {total_predicted_floods}')
 
                 # --- Save Model Checkpoints ---
                 save_dir = os.path.join(script_dir, 'saved_models')
