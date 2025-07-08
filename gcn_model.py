@@ -41,7 +41,7 @@ class SpatioTemporalGCN(nn.Module):
         # 1. Flatten the temporal dimension of dynamic features
         # x_dynamic shape: (num_nodes, seq_len, dynamic_features)
         # We flatten it to (num_nodes, seq_len * dynamic_features)
-        dynamic_features_flattened = x_dynamic.view(x_dynamic.size(0), -1)
+        dynamic_features_flattened = x_dynamic.reshape(x_dynamic.size(0), -1)
 
         # 2. Combine static and flattened dynamic features
         # Shape: (num_nodes, static_dim + flattened_dynamic_dim)
