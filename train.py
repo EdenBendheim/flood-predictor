@@ -19,6 +19,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import gc
+import numpy as np
+import matplotlib.pyplot as plt
+import geopandas as gpd
 
 from FloodData import FloodDataset
 from gcn_model import SpatioTemporalGCN
@@ -91,6 +94,73 @@ def test_one_day(model, day_data, device):
     preds = (probs > 0.5).long()
     
     return loss.item(), preds.cpu(), day_data.y.cpu(), probs.cpu()
+
+def plot_loss_curve(epochs, train_losses, val_losses, save_path):
+    """Plots the training and validation loss curves."""
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, train_losses, label='Training Loss')
+    plt.plot(epochs, val_losses, label='Validation Loss')
+    plt.title('Loss Curve')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(save_path)
+    plt.close()
+    print(f"Loss curve saved to {save_path}")
+
+def plot_spatial_predictions(day_labels, day_preds, dataset, save_path):
+    """Generates and saves a spatial plot of ground truth vs. predictions."""
+    try:
+        # --- Download and load US states shapefile ---
+        # Using a publicly available shapefile from the US Census Bureau.
+        shapefile_url = "https://www2.census.gov/geo/tiger/GENZ2018/shp/cb_2018_us_state_500k.zip"
+        us_states = gpd.read_file(shapefile_url)
+    except Exception as e:
+        print(f"Could not download or read shapefile, skipping map plot: {e}")
+        return
+
+    # --- Reshape data to 2D grid ---
+    n_rows, n_cols = dataset.n_rows, dataset.n_cols
+    truth_grid = day_labels.numpy().reshape(n_rows, n_cols)
+    pred_grid = day_preds.numpy().reshape(n_rows, n_cols)
+
+    # --- Create coordinate grids ---
+    lons = np.linspace(dataset.lon_min, dataset.lon_max, n_cols)
+    lats = np.linspace(dataset.lat_max, dataset.lat_min, n_rows)
+    lon_grid, lat_grid = np.meshgrid(lons, lats)
+
+    # --- Plotting ---
+    fig, ax = plt.subplots(1, 1, figsize=(12, 12))
+    
+    # Plot state borders, cropped to our data's extent for focus
+    ax.set_xlim(dataset.lon_min, dataset.lon_max)
+    ax.set_ylim(dataset.lat_min, dataset.lat_max)
+    us_states.plot(ax=ax, edgecolor='black', facecolor='none', linewidth=0.5)
+
+    # --- Overlay heatmaps for truth and predictions ---
+    # Use different colors and slight transparency
+    # Plotting non-zero values only for clarity
+    
+    # Ground Truth (Blue)
+    true_lats = lat_grid[truth_grid > 0]
+    true_lons = lon_grid[truth_grid > 0]
+    ax.scatter(true_lons, true_lats, color='blue', alpha=0.7, label='Actual Floods', marker='s', s=10)
+
+    # Predictions (Red)
+    pred_lats = lat_grid[pred_grid > 0]
+    pred_lons = lon_grid[pred_grid > 0]
+    ax.scatter(pred_lons, pred_lats, color='red', alpha=0.7, label='Predicted Floods', marker='s', s=10)
+
+    ax.set_title('Spatial Comparison of Floods: Actual vs. Predicted (First Test Day)')
+    ax.set_xlabel('Longitude')
+    ax.set_ylabel('Latitude')
+    ax.legend()
+    ax.grid(True)
+    
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"Spatial prediction map saved to {save_path}")
 
 def main(rank, world_size):
     setup(rank, world_size)
@@ -213,6 +283,7 @@ def main(rank, world_size):
 
         # --- Best model tracking ---
         best_val_f1_score = 0.0
+        history = {'train_loss': [], 'val_loss': [], 'epochs': []}
 
         # --- Training Loop ---
         for epoch in range(1, EPOCHS + 1):
@@ -244,6 +315,11 @@ def main(rank, world_size):
                 
                 avg_val_loss = val_total_loss / len(val_sampler) if len(val_sampler) > 0 else 0
                 
+                # --- Store history for plotting ---
+                history['train_loss'].append(avg_epoch_loss)
+                history['val_loss'].append(avg_val_loss)
+                history['epochs'].append(epoch)
+
                 val_f1_score = 0
                 if epoch_val_preds and epoch_val_labels:
                     all_val_preds = torch.cat(epoch_val_preds)
@@ -259,7 +335,7 @@ def main(rank, world_size):
                     
                     print(f'Epoch: {epoch:02d}, Avg Train Loss: {avg_epoch_loss:.4f}, Avg Val Loss: {avg_val_loss:.4f}, Val F1: {val_f1_score:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}')
                     total_predicted_floods = tp + fp
-                    print(f'    > Val Metrics: FN: {fn} | FP: {fp} | Total Predictions: {total_predicted_floods}')
+                    print(f'    > Val Metrics: FN: {fn} | FP: {fp} | Total Predictions: {total_predicted_floods} | Total Floods: {all_val_labels.sum().item()}')
                 else:
                     print(f'Epoch: {epoch:02d}, Avg Train Loss: {avg_epoch_loss:.4f}, Avg Val Loss: {avg_val_loss:.4f}, Val F1: {val_f1_score:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}')
 
@@ -326,6 +402,21 @@ def main(rank, world_size):
                 print(f'    > Precision: {precision:.4f} | Recall: {recall:.4f}')
                 total_predicted_floods = tp + fp
                 print(f'    > Missed Floods (FN): {fn} | False Alarms (FP): {fp} | Total Predicted Floods: {total_predicted_floods}')
+
+            # --- Plotting ---
+            plot_loss_curve(
+                history['epochs'],
+                history['train_loss'],
+                history['val_loss'],
+                save_path=os.path.join(script_dir, 'loss_curve.png')
+            )
+            if epoch_test_labels and epoch_test_preds:
+                plot_spatial_predictions(
+                    epoch_test_labels[0],
+                    epoch_test_preds[0],
+                    test_dataset,
+                    save_path=os.path.join(script_dir, 'spatial_prediction_map.png')
+                )
 
     finally:
         cleanup()
