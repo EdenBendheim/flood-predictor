@@ -364,84 +364,79 @@ def main(rank, world_size):
             
         if rank == 0:
             print("Training finished.")
+
+        # --- Final Evaluation on the Test Set (runs on all ranks) ---
+        if rank == 0:
             print("--- Running Final Evaluation on Test Set ---")
-            # Load the best model for final testing
-            best_model_path = os.path.join(script_dir, 'saved_models', 'best_flood_predictor.pth')
-            model_to_test = model.module
-            if os.path.exists(best_model_path):
-                # Load state dict on CPU first to avoid device mismatches
-                model_to_test.load_state_dict(torch.load(best_model_path, map_location='cpu'))
-                model_to_test.to(device) # Move model to the correct device for this rank
-                if rank == 0:
-                    print("Loaded best model for final evaluation.")
-
-            # --- Final Test Evaluation ---
-            test_tp, test_fp, test_fn, test_tn = 0, 0, 0, 0
-            l1_sum, num_elements = 0.0, 0
-            # Data for plotting is only needed on rank 0
-            plot_labels, plot_preds = None, None
-
-            test_progress_bar = tqdm(test_day_loader, desc="Final Test", unit="day", total=len(test_sampler), disable=(rank != 0 or not sys.stdout.isatty()))
-            for i, day_data in enumerate(test_progress_bar):
-                day_loss, day_preds, day_labels, day_probs = test_one_day(model_to_test, day_data, device)
-                
-                # Calculate local metrics
-                test_tp += ((day_preds == 1) & (day_labels == 1)).sum().item()
-                test_fp += ((day_preds == 1) & (day_labels == 0)).sum().item()
-                test_fn += ((day_preds == 0) & (day_labels == 1)).sum().item()
-                test_tn += ((day_preds == 0) & (day_labels == 0)).sum().item()
-                
-                # Calculate local components for MAE
-                l1_sum += torch.nn.functional.l1_loss(day_probs, day_labels, reduction='sum').item()
-                num_elements += day_labels.numel()
-                
-                # Save the first day's data from rank 0 for plotting
-                if rank == 0 and i == 0:
-                    plot_labels = day_labels
-                    plot_preds = day_preds
-
-            # Reduce all metrics from all processes
-            metrics_tensor = torch.tensor([test_tp, test_fp, test_fn, test_tn, l1_sum, num_elements], dtype=torch.float64).to(device)
-            dist.reduce(metrics_tensor, dst=0, op=dist.ReduceOp.SUM)
-
+        
+        # Load the best model for final testing
+        best_model_path = os.path.join(script_dir, 'saved_models', 'best_flood_predictor.pth')
+        model_to_test = model.module
+        if os.path.exists(best_model_path):
+            # Load state dict on CPU first to avoid device mismatches
+            model_to_test.load_state_dict(torch.load(best_model_path, map_location='cpu'))
+            model_to_test.to(device) # Move model to the correct device for this rank
             if rank == 0:
-                # Unpack reduced metrics
-                total_tp, total_fp, total_fn, total_tn, total_l1_sum, total_elements = metrics_tensor.cpu().numpy()
+                print("Loaded best model for final evaluation.")
 
-                # Calculate final global metrics
-                smudge_mae = total_l1_sum / total_elements if total_elements > 0 else 0
-                precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
-                recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
-                f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-                accuracy = (total_tp + total_tn) / (total_tp + total_tn + total_fp + total_fn) if (total_tp + total_tn + total_fp + total_fn) > 0 else 0
-                
-                # Note: This loss is an approximation based on rank 0's data
-                avg_test_loss = 0 # This metric is not easily calculated globally
+        # --- Final Test Evaluation Loop ---
+        test_tp, test_fp, test_fn, test_tn = 0, 0, 0, 0
+        l1_sum, num_elements = 0.0, 0
+        plot_labels, plot_preds = None, None
 
-                print(f'\nFinal Test Set Metrics:')
-                print(f'  Avg Test Loss (approx): {avg_test_loss:.4f}')
-                print(f'  Test Metrics: Accuracy: {accuracy:.4f} | F1-Score: {f1_score:.4f} | Smudge MAE: {smudge_mae:.4f}')
-                print(f'    > Precision: {precision:.4f} | Recall: {recall:.4f}')
-                total_predicted_floods = total_tp + total_fp
-                total_actual_floods = total_tp + total_fn
-                print(f'    > Missed Floods (FN): {int(total_fn)} | False Alarms (FP): {int(total_fp)} | Total Predicted Floods: {int(total_predicted_floods)} | Total Floods: {int(total_actual_floods)}')
+        test_progress_bar = tqdm(test_day_loader, desc="Final Test", unit="day", total=len(test_sampler), disable=(rank != 0 or not sys.stdout.isatty()))
+        for i, day_data in enumerate(test_progress_bar):
+            day_loss, day_preds, day_labels, day_probs = test_one_day(model_to_test, day_data, device)
+            
+            test_tp += ((day_preds == 1) & (day_labels == 1)).sum().item()
+            test_fp += ((day_preds == 1) & (day_labels == 0)).sum().item()
+            test_fn += ((day_preds == 0) & (day_labels == 1)).sum().item()
+            test_tn += ((day_preds == 0) & (day_labels == 0)).sum().item()
+            
+            l1_sum += torch.nn.functional.l1_loss(day_probs, day_labels, reduction='sum').item()
+            num_elements += day_labels.numel()
+            
+            if rank == 0 and i == 0:
+                plot_labels = day_labels
+                plot_preds = day_preds
 
-            # --- Plotting (only on rank 0) ---
-            if rank == 0:
-                plot_loss_curve(
-                    history['epochs'],
-                    history['train_loss'],
-                    history['val_loss'],
-                    save_path=os.path.join(script_dir, 'loss_curve.png')
+        # Reduce all metrics from all processes
+        metrics_tensor = torch.tensor([test_tp, test_fp, test_fn, test_tn, l1_sum, num_elements], dtype=torch.float64).to(device)
+        dist.reduce(metrics_tensor, dst=0, op=dist.ReduceOp.SUM)
+
+        # --- Final Metrics and Plotting (on rank 0) ---
+        if rank == 0:
+            total_tp, total_fp, total_fn, total_tn, total_l1_sum, total_elements = metrics_tensor.cpu().numpy()
+
+            smudge_mae = total_l1_sum / total_elements if total_elements > 0 else 0
+            precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
+            recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
+            f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+            accuracy = (total_tp + total_tn) / (total_tp + total_tn + total_fp + total_fn) if (total_tp + total_tn + total_fp + total_fn) > 0 else 0
+            
+            avg_test_loss = 0
+
+            print(f'\nFinal Test Set Metrics:')
+            print(f'  Avg Test Loss (approx): {avg_test_loss:.4f}')
+            print(f'  Test Metrics: Accuracy: {accuracy:.4f} | F1-Score: {f1_score:.4f} | Smudge MAE: {smudge_mae:.4f}')
+            print(f'    > Precision: {precision:.4f} | Recall: {recall:.4f}')
+            total_predicted_floods = total_tp + total_fp
+            total_actual_floods = total_tp + total_fn
+            print(f'    > Missed Floods (FN): {int(total_fn)} | False Alarms (FP): {int(total_fp)} | Total Predicted Floods: {int(total_predicted_floods)} | Total Floods: {int(total_actual_floods)}')
+
+            plot_loss_curve(
+                history['epochs'],
+                history['train_loss'],
+                history['val_loss'],
+                save_path=os.path.join(script_dir, 'loss_curve.png')
+            )
+            if plot_labels is not None and plot_preds is not None:
+                plot_spatial_predictions(
+                    plot_labels,
+                    plot_preds,
+                    test_dataset,
+                    save_path=os.path.join(script_dir, 'spatial_prediction_map.png')
                 )
-                if plot_labels is not None and plot_preds is not None:
-                    # For the plot, we only need one day's worth of data
-                    plot_spatial_predictions(
-                        plot_labels,
-                        plot_preds,
-                        test_dataset,
-                        save_path=os.path.join(script_dir, 'spatial_prediction_map.png')
-                    )
 
     finally:
         cleanup()
