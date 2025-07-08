@@ -75,3 +75,7 @@ saved_models*/
 
 # Jupyter Notebook
 .ipynb_checkpoints saved_models/
+
+# Local utility scripts
+preprocessing/Caldor/Caldor Paper/FloodPredictor/shapefile_uploader.py
+preprocessing/Caldor/Caldor Paper/FloodPredictor/wldas_redownloader.py
