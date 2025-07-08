@@ -14,13 +14,13 @@ from read_dem import process_dem_data
 
 # Helper function for parallel processing
 # It must be defined at the top level to be pickleable by multiprocessing
-def process_single_day(idx, processed_dir, wldas_files, floods_by_date, agg_grid, lat_min_us, lat_max_us, lon_min_us, lon_max_us, n_rows, n_cols, num_nodes, edge_index, edge_weight):
+def process_single_day(idx, processed_dir, wldas_files, floods_by_date, agg_grid, lat_min_us, lat_max_us, lon_min_us, lon_max_us, n_rows, n_cols, num_nodes, edge_index, edge_weight, downsample_factor):
     try:
         # Recreate the necessary parts of the dataset object for one sample
         # This avoids pickling large objects
         
         # --- Load WLDAS data for the window ---
-        wldas_window_files = wldas_files[idx:idx+14]
+        wldas_window_files = wldas_files[idx:idx+8]
         feature_vars = [
             'Rainf_tavg', 'SoilMoi00_10cm_tavg', 'Snowf_tavg', 'Tair_f_tavg',
             'Evap_tavg', 'SWE_tavg', 'Qs_tavg', 'Qsb_tavg'
@@ -29,9 +29,36 @@ def process_single_day(idx, processed_dir, wldas_files, floods_by_date, agg_grid
         for f in wldas_window_files:
             with xr.open_dataset(f) as ds:
                 features = ds[feature_vars].to_array(dim="variable").values
-                features = features.squeeze().transpose(1, 2, 0)
-                reshaped_features = features.reshape(num_nodes, len(feature_vars))
-                all_features.append(reshaped_features)
+                
+                # Downsample the spatial dimensions of the features
+                zoom_factors = (1, 1 / downsample_factor, 1 / downsample_factor)
+                downsampled_features = zoom(features, zoom_factors, order=1, prefilter=False)
+
+                downsampled_features = downsampled_features.squeeze().transpose(1, 2, 0)
+                reshaped_features = downsampled_features.reshape(-1, len(feature_vars))
+            
+            # --- Create historical flood feature for this day ---
+            date_part = os.path.basename(f).split('_')[-1].split('.')[0]
+            current_date = pd.to_datetime(date_part, format='%Y%m%d').date()
+            
+            historical_flood_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
+            daily_flood_coords = floods_by_date.get(current_date, [])
+
+            if daily_flood_coords:
+                for lat, lon in daily_flood_coords:
+                    row_frac = (lat_max_us - lat) / (lat_max_us - lat_min_us)
+                    col_frac = (lon - lon_min_us) / (lon_max_us - lon_min_us)
+                    grid_row = int(row_frac * n_rows)
+                    grid_col = int(col_frac * n_cols)
+                    if 0 <= grid_row < n_rows and 0 <= grid_col < n_cols:
+                        historical_flood_grid[grid_row, grid_col] = 1.0
+            
+            historical_flood_feature = historical_flood_grid.flatten().reshape(-1, 1)
+
+            # Combine WLDAS features with the historical flood feature
+            combined_daily_features = np.concatenate([reshaped_features, historical_flood_feature], axis=1)
+            all_features.append(combined_daily_features)
+            
         wldas_tensor = torch.tensor(np.stack(all_features, axis=1), dtype=torch.float)
 
         # --- Get static elevation features ---
@@ -42,7 +69,7 @@ def process_single_day(idx, processed_dir, wldas_files, floods_by_date, agg_grid
         elevation_features = torch.nan_to_num(elevation_features, nan=0.0, posinf=0.0, neginf=0.0)
 
         # --- Create target label ---
-        target_day_idx = idx + 14
+        target_day_idx = idx + 8
         target_date_str = os.path.basename(wldas_files[target_day_idx]).split('_')[-1].split('.')[0]
         
         y = torch.zeros(num_nodes, dtype=torch.float)
@@ -52,55 +79,21 @@ def process_single_day(idx, processed_dir, wldas_files, floods_by_date, agg_grid
         daily_flood_coords = floods_by_date.get(target_date, [])
 
         if daily_flood_coords:
-            # --- Vectorized Smudging ---
-            # Work with a 2D numpy grid for easier spatial operations
+            # Create a 2D grid to mark flood locations
             y_grid = y.numpy().reshape(n_rows, n_cols)
 
-            # Pre-calculate the circular falloff patch once per day
-            radius = 5
-            patch_coords = np.arange(-radius, radius + 1)
-            dr_grid, dc_grid = np.meshgrid(patch_coords, patch_coords, indexing='ij')
-            distances = np.sqrt(dr_grid**2 + dc_grid**2)
-            smudge_patch = np.zeros_like(distances, dtype=np.float32)
-            circle_mask = distances <= radius
-            smudge_patch[circle_mask] = 1.0 - (distances[circle_mask] / radius)
-
             for lat, lon in daily_flood_coords:
+                # Map lat/lon to the coarse grid index
                 row_frac = (lat_max_us - lat) / (lat_max_us - lat_min_us)
                 col_frac = (lon - lon_min_us) / (lon_max_us - lon_min_us)
                 grid_row = int(row_frac * n_rows)
                 grid_col = int(col_frac * n_cols)
 
-                # Determine the slice of the main grid to update
-                row_start_raw = grid_row - radius
-                row_end_raw = grid_row + radius + 1
-                col_start_raw = grid_col - radius
-                col_end_raw = grid_col + radius + 1
-
-                # Clip the slice to the grid boundaries
-                row_start_clipped = max(0, row_start_raw)
-                row_end_clipped = min(n_rows, row_end_raw)
-                col_start_clipped = max(0, col_start_raw)
-                col_end_clipped = min(n_cols, col_end_raw)
-
-                # Based on the clipping, determine the slice of the patch to use
-                patch_row_start = row_start_clipped - row_start_raw
-                patch_row_end = patch_row_start + (row_end_clipped - row_start_clipped)
-                patch_col_start = col_start_clipped - col_start_raw
-                patch_col_end = patch_col_start + (col_end_clipped - col_start_clipped)
-
-                # Get the slices
-                target_slice = y_grid[row_start_clipped:row_end_clipped, col_start_clipped:col_end_clipped]
-                patch_slice = smudge_patch[patch_row_start:patch_row_end, patch_col_start:patch_col_end]
-
-                # The shapes should now match perfectly. Apply the smudge.
-                if target_slice.shape == patch_slice.shape:
-                    y_grid[row_start_clipped:row_end_clipped, col_start_clipped:col_end_clipped] = np.maximum(target_slice, patch_slice)
-                # else:
-                    # This else block can be used for debugging if issues persist
-                    # print(f"Shape mismatch! Target: {target_slice.shape}, Patch: {patch_slice.shape}")
+                # Mark the grid cell as flooded if it's within bounds
+                if 0 <= grid_row < n_rows and 0 <= grid_col < n_cols:
+                    y_grid[grid_row, grid_col] = 1.0
             
-            # Convert the 2D numpy grid back to a 1D torch tensor
+            # Convert the 2D grid back to a 1D tensor
             y = torch.from_numpy(y_grid.flatten())
 
         # --- Create and save Data object ---
@@ -121,19 +114,55 @@ def process_single_day(idx, processed_dir, wldas_files, floods_by_date, agg_grid
 
 
 class FloodDataset(Dataset):
-    def __init__(self, root, wldas_dir, flood_csv, transform=None, pre_transform=None, mode='train', train_test_split=0.8):
+    def __init__(self, root, wldas_dir, flood_csv, transform=None, pre_transform=None, mode='train', 
+                 train_years=None, val_years=None, test_years=None):
         self.wldas_dir = wldas_dir
         self.flood_csv_path = flood_csv
         self.mode = mode
         
-        all_wldas_files = sorted([os.path.join(self.wldas_dir, f) for f in os.listdir(self.wldas_dir) if f.endswith('.nc')])
-        
-        split_idx = int(len(all_wldas_files) * train_test_split)
-        if self.mode == 'train':
-            self.wldas_files = all_wldas_files[:split_idx]
-        else:
-            self.wldas_files = all_wldas_files[split_idx:]
+        # --- Define Year Splits ---
+        # Provides default chronological splits if none are given.
+        # train_years = train_years if train_years is not None else list(range(2000, 2017))
+        # val_years = val_years if val_years is not None else [2017, 2018]
+        # test_years = test_years if test_years is not None else [2019, 2020]
+        train_years = train_years if train_years is not None else list(range(2011, 2012))
+        val_years = val_years if val_years is not None else [2013]
+        test_years = test_years if test_years is not None else [2014]
 
+        # --- Scan all files in the single WLDAS directory ---
+        print(f"Scanning for WLDAS data in: {self.wldas_dir}")
+        all_files_in_dir = sorted([os.path.join(self.wldas_dir, f) for f in os.listdir(self.wldas_dir) if f.endswith('.nc')])
+        
+        # --- Filter files based on the year parsed from the filename ---
+        selected_files = []
+        
+        selected_years_range = []
+        if self.mode == 'train':
+            selected_years_range = train_years
+        elif self.mode == 'val':
+            selected_years_range = val_years
+        elif self.mode == 'test':
+            selected_years_range = test_years
+
+        for f_path in all_files_in_dir:
+            basename = os.path.basename(f_path)
+            # Assuming filename format like 'WLDAS_NOAHMP001_DA1_YYYYMMDD.D10.nc'
+            try:
+                date_part = basename.split('_')[-1].split('.')[0] # e.g., 20120101
+                year = int(date_part[:4])
+                if year in selected_years_range:
+                    selected_files.append(f_path)
+            except (IndexError, ValueError):
+                # This handles cases where filenames might not match the expected format.
+                print(f"Could not parse year from filename: {basename}. Skipping.")
+                continue
+
+        self.wldas_files = selected_files
+        print(f"Found {len(self.wldas_files)} files for mode '{self.mode}'")
+
+        if not self.wldas_files:
+            raise FileNotFoundError(f"No WLDAS .nc files found for mode '{self.mode}' in the specified year ranges.")
+            
         super(FloodDataset, self).__init__(root, transform, pre_transform)
         
     @property
@@ -144,31 +173,41 @@ class FloodDataset(Dataset):
     @property
     def processed_file_names(self):
         # The names of the files that will be generated in self.processed_dir
-        return [f'data_{i}.pt' for i in range(len(self.wldas_files) - 14)]
+        return [f'data_{i}.pt' for i in range(len(self.wldas_files) - 8)]
 
     def len(self):
-        return len(self.wldas_files) - 14
+        return len(self.wldas_files) - 8
 
     def process(self):
         print("Starting one-time pre-processing...")
         
+        # --- Define downsampling factor ---
+        DOWNSAMPLE_FACTOR = 10
+        print(f"Using spatial downsampling factor: {DOWNSAMPLE_FACTOR}")
+
         # --- Perform one-time setup for elevation and graph structure ---
         print("Preparing elevation grid and graph structure (this happens once)...")
         agg_grid, lat_min_us, lat_max_us, lon_min_us, lon_max_us = process_dem_data()
         
         sample_wldas_file = self.wldas_files[0]
         with xr.open_dataset(sample_wldas_file) as ds:
-            target_rows, target_cols = ds.sizes['lat'], ds.sizes['lon']
+            original_rows, original_cols = ds.sizes['lat'], ds.sizes['lon']
 
         # Ensure agg_grid is 3D for zoom compatibility
         if agg_grid.ndim == 2:
             agg_grid = agg_grid[:, :, np.newaxis]
 
-        zoom_factors = (target_rows / agg_grid.shape[0], target_cols / agg_grid.shape[1], 1)
-        agg_grid = zoom(agg_grid, zoom_factors, order=1)
+        # Resample DEM to match the original WLDAS resolution first
+        zoom_factors_match = (original_rows / agg_grid.shape[0], original_cols / agg_grid.shape[1], 1)
+        agg_grid_matched = zoom(agg_grid, zoom_factors_match, order=1, prefilter=False)
+
+        # Now, downsample the matched grid
+        zoom_factors_downsample = (1 / DOWNSAMPLE_FACTOR, 1 / DOWNSAMPLE_FACTOR, 1)
+        agg_grid = zoom(agg_grid_matched, zoom_factors_downsample, order=1, prefilter=False)
         
         n_rows, n_cols, _ = agg_grid.shape
         num_nodes = n_rows * n_cols
+        print(f"Downsampled grid to {n_rows}x{n_cols} ({num_nodes} nodes).")
         
         # Create graph structure
         edges, weights = [], []
@@ -256,7 +295,8 @@ class FloodDataset(Dataset):
                               n_rows=n_rows, n_cols=n_cols,
                               num_nodes=num_nodes,
                               edge_index=edge_index,
-                              edge_weight=edge_weight)
+                              edge_weight=edge_weight,
+                              downsample_factor=DOWNSAMPLE_FACTOR)
 
         with Pool(processes=num_cores) as pool:
             # Create a tqdm progress bar
@@ -283,9 +323,9 @@ if __name__ == '__main__':
     print("Initializing dataset...")
     dataset = FloodDataset(
         root='./data/flood_dataset_test_parallel', # Use a new root to trigger processing
-        wldas_dir='WLDAS_2012',
+        wldas_dir='WLDAS', # This should be the single directory with all .nc files
         flood_csv='USFD_v1.0.csv',
-        mode='test' # Use a smaller dataset for testing
+        mode='test' # Use 'train', 'val', or 'test'
     )
 
     print(f"Dataset size: {len(dataset)}")

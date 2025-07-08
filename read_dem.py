@@ -44,8 +44,10 @@ def process_dem_data():
     print(f"Found {len(all_dem_files)} DEM tiles.")
     
     # --- Hardcoded WLDAS Boundaries ---
-    wldas_lat_min, wldas_lat_max = 25.065, 52.925
-    wldas_lon_min, wldas_lon_max = -124.925, -89.025
+    wldas_lat_max = 40.0
+    wldas_lon_min = -110.0
+    wldas_lat_min = 25.065
+    wldas_lon_max = -89.025
 
     # --- Filter DEM files to ensure they are within the WLDAS bounding box ---
     filtered_dem_files = []
