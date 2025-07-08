@@ -305,65 +305,44 @@ def main(rank, world_size):
             avg_epoch_loss = epoch_total_loss / len(train_sampler) if len(train_sampler) > 0 else 0
             
             # --- Evaluation Step ---
-            val_total_loss = 0
-            epoch_val_preds, epoch_val_labels = [], []
+            val_tp = 0
+            val_fp = 0
+            val_fn = 0
             
             val_progress_bar = tqdm(val_day_loader, desc=f"Epoch {epoch:02d} (Val)", unit="day", total=len(val_sampler), disable=(rank != 0 or not sys.stdout.isatty()))
             for day_data in val_progress_bar:
                 day_loss, day_preds, day_labels, _ = test_one_day(model.module, day_data, device)
-                val_total_loss += day_loss
-                if day_preds.numel() > 0:
-                    epoch_val_preds.append(day_preds)
-                    epoch_val_labels.append(day_labels)
+                
+                # Calculate local metrics for the batch
+                val_tp += ((day_preds == 1) & (day_labels == 1)).sum().item()
+                val_fp += ((day_preds == 1) & (day_labels == 0)).sum().item()
+                val_fn += ((day_preds == 0) & (day_labels == 1)).sum().item()
             
-            # --- Gather results from all processes ---
-            if rank == 0:
-                gathered_preds = [None] * world_size
-                gathered_labels = [None] * world_size
-            else:
-                gathered_preds = None
-                gathered_labels = None
-            
-            dist.gather_object(epoch_val_preds, gathered_preds if rank == 0 else None, dst=0)
-            dist.gather_object(epoch_val_labels, gathered_labels if rank == 0 else None, dst=0)
-
-            # Synchronize all processes before continuing
-            dist.barrier()
+            # --- Reduce (sum) results from all processes to rank 0 ---
+            # This is more robust than gathering large lists of tensors.
+            metrics_tensor = torch.tensor([val_tp, val_fp, val_fn], dtype=torch.float32).to(device)
+            dist.reduce(metrics_tensor, dst=0, op=dist.ReduceOp.SUM)
 
             # --- Evaluation Metrics (on rank 0) ---
             if rank == 0:
-                # Flatten the lists of lists into a single list of tensors
-                all_val_preds_list = [item for sublist in gathered_preds for item in sublist]
-                all_val_labels_list = [item for sublist in gathered_labels for item in sublist]
+                # Unpack the reduced tensor
+                total_tp, total_fp, total_fn = metrics_tensor.cpu().numpy()
 
-                # Calculate average loss across all processes
-                # Note: This is an approximation as batch sizes might vary slightly.
-                # A more precise way would be to gather the loss from each process too.
-                avg_val_loss = val_total_loss / len(val_sampler) if len(val_sampler) > 0 else 0
-                
                 # --- Store history for plotting ---
+                # Note: These loss values are approximations based on rank 0's data
+                avg_val_loss = 0 # This metric is no longer easily calculated globally, focusing on F1
                 history['train_loss'].append(avg_epoch_loss)
-                history['val_loss'].append(avg_val_loss)
+                history['val_loss'].append(avg_val_loss) # Can be removed if not needed
                 history['epochs'].append(epoch)
 
-                val_f1_score = 0
-                if all_val_preds_list and all_val_labels_list:
-                    all_val_preds = torch.cat(all_val_preds_list)
-                    all_val_labels = torch.cat(all_val_labels_list).long()
-                    
-                    tp = ((all_val_preds == 1) & (all_val_labels == 1)).sum().item()
-                    fp = ((all_val_preds == 1) & (all_val_labels == 0)).sum().item()
-                    fn = ((all_val_preds == 0) & (all_val_labels == 1)).sum().item()
-                    
-                    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-                    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-                    val_f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-                    
-                    print(f'Epoch: {epoch:02d}, Avg Train Loss: {avg_epoch_loss:.4f}, Avg Val Loss: {avg_val_loss:.4f}, Val F1: {val_f1_score:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}')
-                    total_predicted_floods = tp + fp
-                    print(f'    > Val Metrics: FN: {fn} | FP: {fp} | Total Predictions: {total_predicted_floods} | Total Floods: {all_val_labels.sum().item()}')
-                else:
-                    print(f'Epoch: {epoch:02d}, Avg Train Loss: {avg_epoch_loss:.4f}, Avg Val Loss: {avg_val_loss:.4f}, Val F1: {val_f1_score:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}')
+                precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
+                recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
+                val_f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+
+                print(f'Epoch: {epoch:02d}, Avg Train Loss: {avg_epoch_loss:.4f}, Val F1: {val_f1_score:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}')
+                total_predicted_floods = total_tp + total_fp
+                total_actual_floods = total_tp + total_fn
+                print(f'    > Val Metrics: FN: {int(total_fn)} | FP: {int(total_fp)} | Total Predictions: {int(total_predicted_floods)} | Total Floods: {int(total_actual_floods)}')
 
                 # --- Save Model Checkpoints based on Validation F1 ---
                 save_dir = os.path.join(script_dir, 'saved_models')
@@ -395,80 +374,79 @@ def main(rank, world_size):
                 if rank == 0:
                     print("Loaded best model for final evaluation.")
 
-            test_total_loss = 0
-            epoch_test_preds, epoch_test_labels, epoch_test_probs = [], [], []
+            # --- Final Test Evaluation ---
+            test_tp, test_fp, test_fn, test_tn = 0, 0, 0, 0
+            all_test_probs, all_test_labels = [], []
             test_progress_bar = tqdm(test_day_loader, desc="Final Test", unit="day", total=len(test_sampler), disable=(rank != 0 or not sys.stdout.isatty()))
             for day_data in test_progress_bar:
                 day_loss, day_preds, day_labels, day_probs = test_one_day(model_to_test, day_data, device)
-                test_total_loss += day_loss
-                if day_preds.numel() > 0:
-                    epoch_test_preds.append(day_preds)
-                    epoch_test_labels.append(day_labels)
-                    epoch_test_probs.append(day_probs)
-
-            # --- Gather test results from all processes ---
-            if rank == 0:
-                gathered_test_preds = [None] * world_size
-                gathered_test_labels = [None] * world_size
-                gathered_test_probs = [None] * world_size
-            else:
-                gathered_test_preds = None
-                gathered_test_labels = None
-                gathered_test_probs = None
-
-            dist.gather_object(epoch_test_preds, gathered_test_preds if rank == 0 else None, dst=0)
-            dist.gather_object(epoch_test_labels, gathered_test_labels if rank == 0 else None, dst=0)
-            dist.gather_object(epoch_test_probs, gathered_test_probs if rank == 0 else None, dst=0)
-            
-            dist.barrier()
-
-            if rank == 0:
-                all_preds_list = [item for sublist in gathered_test_preds for item in sublist]
-                all_labels_list = [item for sublist in gathered_test_labels for item in sublist]
-                all_probs_list = [item for sublist in gathered_test_probs for item in sublist]
-
-                # Note: This loss is also an approximation based on rank 0's data
-                avg_test_loss = test_total_loss / len(test_sampler)
                 
-                if all_preds_list and all_labels_list:
-                    all_preds = torch.cat(all_preds_list)
+                test_tp += ((day_preds == 1) & (day_labels == 1)).sum().item()
+                test_fp += ((day_preds == 1) & (day_labels == 0)).sum().item()
+                test_fn += ((day_preds == 0) & (day_labels == 1)).sum().item()
+                test_tn += ((day_preds == 0) & (day_labels == 0)).sum().item()
+                
+                # We still need to gather these for the MAE and plotting
+                all_test_probs.append(day_probs)
+                all_test_labels.append(day_labels)
+
+            # Reduce the integer metrics
+            test_metrics_tensor = torch.tensor([test_tp, test_fp, test_fn, test_tn], dtype=torch.float32).to(device)
+            dist.reduce(test_metrics_tensor, dst=0, op=dist.ReduceOp.SUM)
+            
+            # Gather the tensor lists for plotting and MAE
+            gathered_test_probs = [None] * world_size
+            gathered_test_labels = [None] * world_size
+            dist.all_gather_object(gathered_test_probs, all_test_probs)
+            dist.all_gather_object(gathered_test_labels, all_test_labels)
+
+            if rank == 0:
+                # Unpack reduced metrics
+                total_tp, total_fp, total_fn, total_tn = test_metrics_tensor.cpu().numpy()
+
+                # Unpack gathered lists for plotting/MAE
+                all_probs_list = [item for sublist in gathered_test_probs for item in sublist]
+                all_labels_list = [item for sublist in gathered_test_labels for item in sublist]
+                
+                if all_probs_list and all_labels_list:
                     all_labels_float = torch.cat(all_labels_list)
                     all_probs = torch.cat(all_probs_list)
-                    
                     smudge_mae = torch.nn.functional.l1_loss(all_probs, all_labels_float).item()
-                    all_labels_binary = all_labels_float.long()
-                    
-                    tp = ((all_preds == 1) & (all_labels_binary == 1)).sum().item()
-                    fp = ((all_preds == 1) & (all_labels_binary == 0)).sum().item()
-                    fn = ((all_preds == 0) & (all_labels_binary == 1)).sum().item()
-                    tn = ((all_preds == 0) & (all_labels_binary == 0)).sum().item()
-                    
-                    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-                    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-                    f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-                    accuracy = (tp + tn) / (tp + tn + fp + fn)
+                else:
+                    smudge_mae = 0
 
-                    print(f'\nFinal Test Set Metrics:')
-                    print(f'  Avg Test Loss: {avg_test_loss:.4f}')
-                    print(f'  Test Metrics: Accuracy: {accuracy:.4f} | F1-Score: {f1_score:.4f} | Smudge MAE: {smudge_mae:.4f}')
-                    print(f'    > Precision: {precision:.4f} | Recall: {recall:.4f}')
-                    total_predicted_floods = tp + fp
-                    print(f'    > Missed Floods (FN): {fn} | False Alarms (FP): {fp} | Total Predicted Floods: {total_predicted_floods}')
+                precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
+                recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
+                f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+                accuracy = (total_tp + total_tn) / (total_tp + total_tn + total_fp + total_fn) if (total_tp + total_tn + total_fp + total_fn) > 0 else 0
+                
+                # Note: This loss is an approximation based on rank 0's data
+                avg_test_loss = 0 # This metric is no longer easily calculated globally
 
-            # --- Plotting ---
-            plot_loss_curve(
-                history['epochs'],
-                history['train_loss'],
-                history['val_loss'],
-                save_path=os.path.join(script_dir, 'loss_curve.png')
-            )
-            if epoch_test_labels and epoch_test_preds:
-                plot_spatial_predictions(
-                    epoch_test_labels[0],
-                    epoch_test_preds[0],
-                    test_dataset,
-                    save_path=os.path.join(script_dir, 'spatial_prediction_map.png')
+                print(f'\nFinal Test Set Metrics:')
+                print(f'  Avg Test Loss (approx): {avg_test_loss:.4f}')
+                print(f'  Test Metrics: Accuracy: {accuracy:.4f} | F1-Score: {f1_score:.4f} | Smudge MAE: {smudge_mae:.4f}')
+                print(f'    > Precision: {precision:.4f} | Recall: {recall:.4f}')
+                total_predicted_floods = total_tp + total_fp
+                total_actual_floods = total_tp + total_fn
+                print(f'    > Missed Floods (FN): {int(total_fn)} | False Alarms (FP): {int(total_fp)} | Total Predicted Floods: {int(total_predicted_floods)} | Total Floods: {int(total_actual_floods)}')
+
+            # --- Plotting (only on rank 0) ---
+            if rank == 0:
+                plot_loss_curve(
+                    history['epochs'],
+                    history['train_loss'],
+                    history['val_loss'],
+                    save_path=os.path.join(script_dir, 'loss_curve.png')
                 )
+                if all_labels_list and all_probs_list:
+                    # For the plot, we only need one day's worth of data
+                    plot_spatial_predictions(
+                        all_labels_list[0],
+                        (torch.cat(all_probs_list) > 0.5).long(), # Recreate preds for one day for plotting
+                        test_dataset,
+                        save_path=os.path.join(script_dir, 'spatial_prediction_map.png')
+                    )
 
     finally:
         cleanup()
