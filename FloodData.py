@@ -61,7 +61,7 @@ def process_single_day(idx, processed_dir, wldas_files, floods_by_date, agg_grid
             combined_daily_features = np.concatenate([reshaped_features, historical_flood_feature], axis=1)
             all_features.append(combined_daily_features)
             
-        wldas_tensor = torch.tensor(np.stack(all_features, axis=1), dtype=torch.float)
+        wldas_tensor = torch.tensor(np.stack(all_features, axis=1), dtype=torch.float).contiguous()
 
         # --- Get static elevation features ---
         elevation_features = torch.tensor(agg_grid.reshape(num_nodes, -1), dtype=torch.float)
