@@ -109,22 +109,18 @@ def plot_loss_curve(epochs, train_losses, val_losses, save_path):
     plt.close()
     print(f"Loss curve saved to {save_path}")
 
-def plot_spatial_predictions(day_labels, day_preds, dataset, save_path):
+def plot_spatial_predictions(day_labels, day_preds, dataset, shapefile_path, save_path):
     """Generates and saves a spatial plot of ground truth vs. predictions."""
     try:
-        # --- Download and load US states shapefile ---
-        # Using a publicly available shapefile from the US Census Bureau.
-        shapefile_url = "https://www2.census.gov/geo/tiger/GENZ2018/shp/cb_2018_us_state_500k.zip"
-        us_states = gpd.read_file(shapefile_url)
+        us_states = gpd.read_file(shapefile_path)
     except Exception as e:
-        print(f"Could not download or read shapefile, skipping map plot: {e}")
+        print(f"Could not read shapefile from {shapefile_path}, skipping map plot: {e}")
         return
 
-    # --- Hardcoded Geospatial Info (to avoid data regeneration for plotting) ---
-    # These values must match the ones used during the last `process()` run.
-    lat_min, lat_max = 25.065, 40.0
-    lon_min, lon_max = -110.0, -89.025
-    n_rows, n_cols = 279, 359
+    # --- Get Geospatial Info from the dataset object ---
+    lat_min, lat_max = dataset.lat_min, dataset.lat_max
+    lon_min, lon_max = dataset.lon_min, dataset.lon_max
+    n_rows, n_cols = dataset.n_rows, dataset.n_cols
 
     # --- Reshape data to 2D grid ---
     truth_grid = day_labels.numpy().reshape(n_rows, n_cols)
@@ -163,7 +159,7 @@ def plot_spatial_predictions(day_labels, day_preds, dataset, save_path):
     ax.legend()
     ax.grid(True)
     
-    plt.savefig(save_path, dpi=300)
+    plt.savefig(save_path)
     plt.close()
     print(f"Spatial prediction map saved to {save_path}")
 
@@ -431,10 +427,12 @@ def main(rank, world_size):
                 save_path=os.path.join(script_dir, 'loss_curve.png')
             )
             if plot_labels is not None and plot_preds is not None:
+                shapefile_path = os.path.join(os.path.dirname(script_dir), "us-border")
                 plot_spatial_predictions(
                     plot_labels,
                     plot_preds,
                     test_dataset,
+                    shapefile_path,
                     save_path=os.path.join(script_dir, 'spatial_prediction_map.png')
                 )
 
