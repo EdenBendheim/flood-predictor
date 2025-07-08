@@ -61,7 +61,7 @@ def process_single_day(idx, processed_dir, wldas_files, floods_by_date, agg_grid
             combined_daily_features = np.concatenate([reshaped_features, historical_flood_feature], axis=1)
             all_features.append(combined_daily_features)
             
-        wldas_tensor = torch.tensor(np.stack(all_features, axis=1), dtype=torch.float)
+        wldas_tensor = torch.tensor(np.stack(all_features, axis=1), dtype=torch.float).contiguous()
 
         # --- Get static elevation features ---
         elevation_features = torch.tensor(agg_grid.reshape(num_nodes, -1), dtype=torch.float)
@@ -191,6 +191,10 @@ class FloodDataset(Dataset):
         print("Preparing elevation grid and graph structure (this happens once)...")
         agg_grid, lat_min_us, lat_max_us, lon_min_us, lon_max_us = process_dem_data()
         
+        # --- Store boundaries and grid dimensions for later use in plotting ---
+        self.lat_min, self.lat_max = lat_min_us, lat_max_us
+        self.lon_min, self.lon_max = lon_min_us, lon_max_us
+
         sample_wldas_file = self.wldas_files[0]
         with xr.open_dataset(sample_wldas_file) as ds:
             original_rows, original_cols = ds.sizes['lat'], ds.sizes['lon']
@@ -208,6 +212,7 @@ class FloodDataset(Dataset):
         agg_grid = zoom(agg_grid_matched, zoom_factors_downsample, order=1, prefilter=False)
         
         n_rows, n_cols, _ = agg_grid.shape
+        self.n_rows, self.n_cols = n_rows, n_cols # Store grid shape
         num_nodes = n_rows * n_cols
         print(f"Downsampled grid to {n_rows}x{n_cols} ({num_nodes} nodes).")
         

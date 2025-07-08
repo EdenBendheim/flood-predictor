@@ -19,6 +19,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import gc
+import numpy as np
+import matplotlib.pyplot as plt
+import geopandas as gpd
 
 from FloodData import FloodDataset
 from gcn_model import SpatioTemporalGCN
@@ -91,6 +94,78 @@ def test_one_day(model, day_data, device):
     preds = (probs > 0.5).long()
     
     return loss.item(), preds.cpu(), day_data.y.cpu(), probs.cpu()
+
+def plot_loss_curve(epochs, train_losses, val_losses, save_path):
+    """Plots the training and validation loss curves."""
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, train_losses, label='Training Loss')
+    plt.plot(epochs, val_losses, label='Validation Loss')
+    plt.title('Loss Curve')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(save_path)
+    plt.close()
+    print(f"Loss curve saved to {save_path}")
+
+def plot_spatial_predictions(day_labels, day_preds, dataset, save_path):
+    """Generates and saves a spatial plot of ground truth vs. predictions."""
+    try:
+        # --- Download and load US states shapefile ---
+        # Using a publicly available shapefile from the US Census Bureau.
+        shapefile_url = "https://www2.census.gov/geo/tiger/GENZ2018/shp/cb_2018_us_state_500k.zip"
+        us_states = gpd.read_file(shapefile_url)
+    except Exception as e:
+        print(f"Could not download or read shapefile, skipping map plot: {e}")
+        return
+
+    # --- Hardcoded Geospatial Info (to avoid data regeneration for plotting) ---
+    # These values must match the ones used during the last `process()` run.
+    lat_min, lat_max = 25.065, 40.0
+    lon_min, lon_max = -110.0, -89.025
+    n_rows, n_cols = 279, 359
+
+    # --- Reshape data to 2D grid ---
+    truth_grid = day_labels.numpy().reshape(n_rows, n_cols)
+    pred_grid = day_preds.numpy().reshape(n_rows, n_cols)
+
+    # --- Create coordinate grids ---
+    lons = np.linspace(lon_min, lon_max, n_cols)
+    lats = np.linspace(lat_max, lat_min, n_rows)
+    lon_grid, lat_grid = np.meshgrid(lons, lats)
+
+    # --- Plotting ---
+    fig, ax = plt.subplots(1, 1, figsize=(12, 12))
+    
+    # Plot state borders, cropped to our data's extent for focus
+    ax.set_xlim(lon_min, lon_max)
+    ax.set_ylim(lat_min, lat_max)
+    us_states.plot(ax=ax, edgecolor='black', facecolor='none', linewidth=0.5)
+
+    # --- Overlay heatmaps for truth and predictions ---
+    # Use different colors and slight transparency
+    # Plotting non-zero values only for clarity
+    
+    # Ground Truth (Blue)
+    true_lats = lat_grid[truth_grid > 0]
+    true_lons = lon_grid[truth_grid > 0]
+    ax.scatter(true_lons, true_lats, color='blue', alpha=0.7, label='Actual Floods', marker='s', s=10)
+
+    # Predictions (Red)
+    pred_lats = lat_grid[pred_grid > 0]
+    pred_lons = lon_grid[pred_grid > 0]
+    ax.scatter(pred_lons, pred_lats, color='red', alpha=0.7, label='Predicted Floods', marker='s', s=10)
+
+    ax.set_title('Spatial Comparison of Floods: Actual vs. Predicted (First Test Day)')
+    ax.set_xlabel('Longitude')
+    ax.set_ylabel('Latitude')
+    ax.legend()
+    ax.grid(True)
+    
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"Spatial prediction map saved to {save_path}")
 
 def main(rank, world_size):
     setup(rank, world_size)
@@ -213,6 +288,7 @@ def main(rank, world_size):
 
         # --- Best model tracking ---
         best_val_f1_score = 0.0
+        history = {'train_loss': [], 'val_loss': [], 'epochs': []}
 
         # --- Training Loop ---
         for epoch in range(1, EPOCHS + 1):
@@ -228,26 +304,45 @@ def main(rank, world_size):
             
             avg_epoch_loss = epoch_total_loss / len(train_sampler) if len(train_sampler) > 0 else 0
             
-            # --- Evaluation Step (on rank 0) ---
+            # --- Evaluation Step ---
+            val_total_loss = 0
+            epoch_val_preds, epoch_val_labels = [], []
+            
+            val_progress_bar = tqdm(val_day_loader, desc=f"Epoch {epoch:02d} (Val)", unit="day", total=len(val_sampler), disable=(rank != 0 or not sys.stdout.isatty()))
+            for day_data in val_progress_bar:
+                day_loss, day_preds, day_labels, _ = test_one_day(model.module, day_data, device)
+                val_total_loss += day_loss
+                if day_preds.numel() > 0:
+                    epoch_val_preds.append(day_preds)
+                    epoch_val_labels.append(day_labels)
+            
+            # --- Gather results from all processes ---
+            # Each item in the list is a list of tensors from a single process.
+            gathered_preds = [None] * world_size
+            gathered_labels = [None] * world_size
+            dist.all_gather_object(gathered_preds, epoch_val_preds)
+            dist.all_gather_object(gathered_labels, epoch_val_labels)
+
+            # --- Evaluation Metrics (on rank 0) ---
             if rank == 0:
-                # --- Validation Phase ---
-                val_total_loss = 0
-                epoch_val_preds, epoch_val_labels = [], []
-                
-                val_progress_bar = tqdm(val_day_loader, desc=f"Epoch {epoch:02d} (Val)", unit="day", total=len(val_sampler), disable=not sys.stdout.isatty())
-                for day_data in val_progress_bar:
-                    day_loss, day_preds, day_labels, _ = test_one_day(model.module, day_data, device)
-                    val_total_loss += day_loss
-                    if day_preds.numel() > 0:
-                        epoch_val_preds.append(day_preds)
-                        epoch_val_labels.append(day_labels)
-                
+                # Flatten the lists of lists into a single list of tensors
+                all_val_preds_list = [item for sublist in gathered_preds for item in sublist]
+                all_val_labels_list = [item for sublist in gathered_labels for item in sublist]
+
+                # Calculate average loss across all processes
+                # Note: This is an approximation as batch sizes might vary slightly.
+                # A more precise way would be to gather the loss from each process too.
                 avg_val_loss = val_total_loss / len(val_sampler) if len(val_sampler) > 0 else 0
                 
+                # --- Store history for plotting ---
+                history['train_loss'].append(avg_epoch_loss)
+                history['val_loss'].append(avg_val_loss)
+                history['epochs'].append(epoch)
+
                 val_f1_score = 0
-                if epoch_val_preds and epoch_val_labels:
-                    all_val_preds = torch.cat(epoch_val_preds)
-                    all_val_labels = torch.cat(epoch_val_labels).long()
+                if all_val_preds_list and all_val_labels_list:
+                    all_val_preds = torch.cat(all_val_preds_list)
+                    all_val_labels = torch.cat(all_val_labels_list).long()
                     
                     tp = ((all_val_preds == 1) & (all_val_labels == 1)).sum().item()
                     fp = ((all_val_preds == 1) & (all_val_labels == 0)).sum().item()
@@ -259,7 +354,7 @@ def main(rank, world_size):
                     
                     print(f'Epoch: {epoch:02d}, Avg Train Loss: {avg_epoch_loss:.4f}, Avg Val Loss: {avg_val_loss:.4f}, Val F1: {val_f1_score:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}')
                     total_predicted_floods = tp + fp
-                    print(f'    > Val Metrics: FN: {fn} | FP: {fp} | Total Predictions: {total_predicted_floods}')
+                    print(f'    > Val Metrics: FN: {fn} | FP: {fp} | Total Predictions: {total_predicted_floods} | Total Floods: {all_val_labels.sum().item()}')
                 else:
                     print(f'Epoch: {epoch:02d}, Avg Train Loss: {avg_epoch_loss:.4f}, Avg Val Loss: {avg_val_loss:.4f}, Val F1: {val_f1_score:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}')
 
@@ -285,47 +380,80 @@ def main(rank, world_size):
             print("--- Running Final Evaluation on Test Set ---")
             # Load the best model for final testing
             best_model_path = os.path.join(script_dir, 'saved_models', 'best_flood_predictor.pth')
+            model_to_test = model.module
             if os.path.exists(best_model_path):
-                model.module.load_state_dict(torch.load(best_model_path))
-                print("Loaded best model for final evaluation.")
+                # Load state dict on CPU first to avoid device mismatches
+                model_to_test.load_state_dict(torch.load(best_model_path, map_location='cpu'))
+                model_to_test.to(device) # Move model to the correct device for this rank
+                if rank == 0:
+                    print("Loaded best model for final evaluation.")
 
             test_total_loss = 0
             epoch_test_preds, epoch_test_labels, epoch_test_probs = [], [], []
-            test_progress_bar = tqdm(test_day_loader, desc="Final Test", unit="day", total=len(test_sampler), disable=not sys.stdout.isatty())
+            test_progress_bar = tqdm(test_day_loader, desc="Final Test", unit="day", total=len(test_sampler), disable=(rank != 0 or not sys.stdout.isatty()))
             for day_data in test_progress_bar:
-                day_loss, day_preds, day_labels, day_probs = test_one_day(model.module, day_data, device)
+                day_loss, day_preds, day_labels, day_probs = test_one_day(model_to_test, day_data, device)
                 test_total_loss += day_loss
                 if day_preds.numel() > 0:
                     epoch_test_preds.append(day_preds)
                     epoch_test_labels.append(day_labels)
                     epoch_test_probs.append(day_probs)
-            
-            avg_test_loss = test_total_loss / len(test_sampler)
-            
-            if epoch_test_preds and epoch_test_labels:
-                all_preds = torch.cat(epoch_test_preds)
-                all_labels_float = torch.cat(epoch_test_labels)
-                all_probs = torch.cat(epoch_test_probs)
-                
-                smudge_mae = torch.nn.functional.l1_loss(all_probs, all_labels_float).item()
-                all_labels_binary = all_labels_float.long()
-                
-                tp = ((all_preds == 1) & (all_labels_binary == 1)).sum().item()
-                fp = ((all_preds == 1) & (all_labels_binary == 0)).sum().item()
-                fn = ((all_preds == 0) & (all_labels_binary == 1)).sum().item()
-                tn = ((all_preds == 0) & (all_labels_binary == 0)).sum().item()
-                
-                precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-                recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-                f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-                accuracy = (tp + tn) / (tp + tn + fp + fn)
 
-                print(f'\nFinal Test Set Metrics:')
-                print(f'  Avg Test Loss: {avg_test_loss:.4f}')
-                print(f'  Test Metrics: Accuracy: {accuracy:.4f} | F1-Score: {f1_score:.4f} | Smudge MAE: {smudge_mae:.4f}')
-                print(f'    > Precision: {precision:.4f} | Recall: {recall:.4f}')
-                total_predicted_floods = tp + fp
-                print(f'    > Missed Floods (FN): {fn} | False Alarms (FP): {fp} | Total Predicted Floods: {total_predicted_floods}')
+            # --- Gather test results from all processes ---
+            gathered_test_preds = [None] * world_size
+            gathered_test_labels = [None] * world_size
+            gathered_test_probs = [None] * world_size
+            dist.all_gather_object(gathered_test_preds, epoch_test_preds)
+            dist.all_gather_object(gathered_test_labels, epoch_test_labels)
+            dist.all_gather_object(gathered_test_probs, epoch_test_probs)
+            
+            if rank == 0:
+                all_preds_list = [item for sublist in gathered_test_preds for item in sublist]
+                all_labels_list = [item for sublist in gathered_test_labels for item in sublist]
+                all_probs_list = [item for sublist in gathered_test_probs for item in sublist]
+
+                # Note: This loss is also an approximation based on rank 0's data
+                avg_test_loss = test_total_loss / len(test_sampler)
+                
+                if all_preds_list and all_labels_list:
+                    all_preds = torch.cat(all_preds_list)
+                    all_labels_float = torch.cat(all_labels_list)
+                    all_probs = torch.cat(all_probs_list)
+                    
+                    smudge_mae = torch.nn.functional.l1_loss(all_probs, all_labels_float).item()
+                    all_labels_binary = all_labels_float.long()
+                    
+                    tp = ((all_preds == 1) & (all_labels_binary == 1)).sum().item()
+                    fp = ((all_preds == 1) & (all_labels_binary == 0)).sum().item()
+                    fn = ((all_preds == 0) & (all_labels_binary == 1)).sum().item()
+                    tn = ((all_preds == 0) & (all_labels_binary == 0)).sum().item()
+                    
+                    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                    f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+                    accuracy = (tp + tn) / (tp + tn + fp + fn)
+
+                    print(f'\nFinal Test Set Metrics:')
+                    print(f'  Avg Test Loss: {avg_test_loss:.4f}')
+                    print(f'  Test Metrics: Accuracy: {accuracy:.4f} | F1-Score: {f1_score:.4f} | Smudge MAE: {smudge_mae:.4f}')
+                    print(f'    > Precision: {precision:.4f} | Recall: {recall:.4f}')
+                    total_predicted_floods = tp + fp
+                    print(f'    > Missed Floods (FN): {fn} | False Alarms (FP): {fp} | Total Predicted Floods: {total_predicted_floods}')
+
+            # --- Plotting ---
+            plot_loss_curve(
+                history['epochs'],
+                history['train_loss'],
+                history['val_loss'],
+                save_path=os.path.join(script_dir, 'loss_curve.png')
+            )
+            if epoch_test_labels and epoch_test_preds:
+                plot_spatial_predictions(
+                    epoch_test_labels[0],
+                    epoch_test_preds[0],
+                    test_dataset,
+                    save_path=os.path.join(script_dir, 'spatial_prediction_map.png')
+                )
 
     finally:
         cleanup()
