@@ -305,6 +305,7 @@ def main(rank, world_size):
             avg_epoch_loss = epoch_total_loss / len(train_sampler) if len(train_sampler) > 0 else 0
             
             # --- Evaluation Step ---
+            val_total_loss = 0
             val_tp = 0
             val_fp = 0
             val_fn = 0
@@ -312,6 +313,7 @@ def main(rank, world_size):
             val_progress_bar = tqdm(val_day_loader, desc=f"Epoch {epoch:02d} (Val)", unit="day", total=len(val_sampler), disable=(rank != 0 or not sys.stdout.isatty()))
             for day_data in val_progress_bar:
                 day_loss, day_preds, day_labels, _ = test_one_day(model.module, day_data, device)
+                val_total_loss += day_loss
                 
                 # Calculate local metrics for the batch
                 val_tp += ((day_preds == 1) & (day_labels == 1)).sum().item()
@@ -329,17 +331,16 @@ def main(rank, world_size):
                 total_tp, total_fp, total_fn = metrics_tensor.cpu().numpy()
 
                 # --- Store history for plotting ---
-                # Note: These loss values are approximations based on rank 0's data
-                avg_val_loss = 0 # This metric is no longer easily calculated globally, focusing on F1
+                avg_val_loss = val_total_loss / len(val_sampler) if len(val_sampler) > 0 else 0
                 history['train_loss'].append(avg_epoch_loss)
-                history['val_loss'].append(avg_val_loss) # Can be removed if not needed
+                history['val_loss'].append(avg_val_loss) 
                 history['epochs'].append(epoch)
 
                 precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
                 recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
                 val_f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
 
-                print(f'Epoch: {epoch:02d}, Avg Train Loss: {avg_epoch_loss:.4f}, Val F1: {val_f1_score:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}')
+                print(f'Epoch: {epoch:02d}, Avg Train Loss: {avg_epoch_loss:.4f}, Avg Val Loss: {avg_val_loss:.4f}, Val F1: {val_f1_score:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}')
                 total_predicted_floods = total_tp + total_fp
                 total_actual_floods = total_tp + total_fn
                 print(f'    > Val Metrics: FN: {int(total_fn)} | FP: {int(total_fp)} | Total Predictions: {int(total_predicted_floods)} | Total Floods: {int(total_actual_floods)}')
@@ -375,11 +376,13 @@ def main(rank, world_size):
                     print("Loaded best model for final evaluation.")
 
             # --- Final Test Evaluation ---
+            test_total_loss = 0
             test_tp, test_fp, test_fn, test_tn = 0, 0, 0, 0
             all_test_probs, all_test_labels = [], []
             test_progress_bar = tqdm(test_day_loader, desc="Final Test", unit="day", total=len(test_sampler), disable=(rank != 0 or not sys.stdout.isatty()))
             for day_data in test_progress_bar:
                 day_loss, day_preds, day_labels, day_probs = test_one_day(model_to_test, day_data, device)
+                test_total_loss += day_loss
                 
                 test_tp += ((day_preds == 1) & (day_labels == 1)).sum().item()
                 test_fp += ((day_preds == 1) & (day_labels == 0)).sum().item()
@@ -408,6 +411,9 @@ def main(rank, world_size):
                 all_probs_list = [item for sublist in gathered_test_probs for item in sublist]
                 all_labels_list = [item for sublist in gathered_test_labels for item in sublist]
                 
+                # Calculate average loss on rank 0's data
+                avg_test_loss = test_total_loss / len(test_sampler) if len(test_sampler) > 0 else 0
+                
                 if all_probs_list and all_labels_list:
                     all_labels_float = torch.cat(all_labels_list)
                     all_probs = torch.cat(all_probs_list)
@@ -420,11 +426,8 @@ def main(rank, world_size):
                 f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
                 accuracy = (total_tp + total_tn) / (total_tp + total_tn + total_fp + total_fn) if (total_tp + total_tn + total_fp + total_fn) > 0 else 0
                 
-                # Note: This loss is an approximation based on rank 0's data
-                avg_test_loss = 0 # This metric is no longer easily calculated globally
-
                 print(f'\nFinal Test Set Metrics:')
-                print(f'  Avg Test Loss (approx): {avg_test_loss:.4f}')
+                print(f'  Avg Test Loss: {avg_test_loss:.4f}')
                 print(f'  Test Metrics: Accuracy: {accuracy:.4f} | F1-Score: {f1_score:.4f} | Smudge MAE: {smudge_mae:.4f}')
                 print(f'    > Precision: {precision:.4f} | Recall: {recall:.4f}')
                 total_predicted_floods = total_tp + total_fp
