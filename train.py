@@ -248,25 +248,25 @@ def main(rank, world_size):
             train_dataset,
             sampler=train_sampler,
             batch_size=None,  # Important: yields one day_data at a time
-            num_workers=0, # Use 0 to avoid multiprocessing deadlocks in distributed setup
+            num_workers=2, # A few persistent workers to load day files
             prefetch_factor=2,
-            persistent_workers=False,
+            persistent_workers=True,
         )
         val_day_loader = DataLoader(
             val_dataset,
             sampler=val_sampler,
             batch_size=None,
-            num_workers=0, # Use 0 to avoid multiprocessing deadlocks in distributed setup
+            num_workers=2,
             prefetch_factor=2,
-            persistent_workers=False,
+            persistent_workers=True,
         )
         test_day_loader = DataLoader(
             test_dataset,
             sampler=test_sampler,
             batch_size=None,
-            num_workers=0, # Use 0 to avoid multiprocessing deadlocks in distributed setup
+            num_workers=2,
             prefetch_factor=2,
-            persistent_workers=False,
+            persistent_workers=True,
         )
 
         # --- Model ---
@@ -318,21 +318,15 @@ def main(rank, world_size):
             
             # --- Gather results from all processes ---
             if rank == 0:
-                # Rank 0 is the master, it will receive data from workers
-                gathered_preds = [epoch_val_preds]
-                gathered_labels = [epoch_val_labels]
-                for i in range(1, world_size):
-                    worker_preds = [None] # Placeholder for receiving object
-                    worker_labels = [None]
-                    dist.recv_object(worker_preds, src=i)
-                    dist.recv_object(worker_labels, src=i)
-                    gathered_preds.append(worker_preds[0])
-                    gathered_labels.append(worker_labels[0])
+                gathered_preds = [None] * world_size
+                gathered_labels = [None] * world_size
             else:
-                # Worker ranks send their data to rank 0
-                dist.send_object([epoch_val_preds], dst=0)
-                dist.send_object([epoch_val_labels], dst=0)
+                gathered_preds = None
+                gathered_labels = None
             
+            dist.gather_object(epoch_val_preds, gathered_preds if rank == 0 else None, dst=0)
+            dist.gather_object(epoch_val_labels, gathered_labels if rank == 0 else None, dst=0)
+
             # Synchronize all processes before continuing
             dist.barrier()
 
@@ -414,23 +408,17 @@ def main(rank, world_size):
 
             # --- Gather test results from all processes ---
             if rank == 0:
-                gathered_test_preds = [epoch_test_preds]
-                gathered_test_labels = [epoch_test_labels]
-                gathered_test_probs = [epoch_test_probs]
-                for i in range(1, world_size):
-                    worker_preds = [None]
-                    worker_labels = [None]
-                    worker_probs = [None]
-                    dist.recv_object(worker_preds, src=i)
-                    dist.recv_object(worker_labels, src=i)
-                    dist.recv_object(worker_probs, src=i)
-                    gathered_test_preds.append(worker_preds[0])
-                    gathered_test_labels.append(worker_labels[0])
-                    gathered_test_probs.append(worker_probs[0])
+                gathered_test_preds = [None] * world_size
+                gathered_test_labels = [None] * world_size
+                gathered_test_probs = [None] * world_size
             else:
-                dist.send_object([epoch_test_preds], dst=0)
-                dist.send_object([epoch_test_labels], dst=0)
-                dist.send_object([epoch_test_probs], dst=0)
+                gathered_test_preds = None
+                gathered_test_labels = None
+                gathered_test_probs = None
+
+            dist.gather_object(epoch_test_preds, gathered_test_preds if rank == 0 else None, dst=0)
+            dist.gather_object(epoch_test_labels, gathered_test_labels if rank == 0 else None, dst=0)
+            dist.gather_object(epoch_test_probs, gathered_test_probs if rank == 0 else None, dst=0)
             
             dist.barrier()
 
