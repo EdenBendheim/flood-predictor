@@ -109,6 +109,41 @@ def main(rank, world_size):
         # --- Dataset ---
         wldas_base_dir = os.path.join(script_dir, 'WLDAS')
         
+        # Designate rank 0 as the sole data processor to prevent race conditions.
+        if rank == 0:
+            print("--- Rank 0: Starting Data Pre-processing check ---")
+            # Instantiating the datasets will trigger the `process` method if data is not cached.
+            # This will be done sequentially for train, val, and test.
+            print("Processing train data...")
+            FloodDataset(
+                root=os.path.join(script_dir, 'data/flood_dataset_train_multiyear'),
+                wldas_dir=wldas_base_dir,
+                flood_csv=os.path.join(script_dir, 'USFD_v1.0.csv'),
+                mode='train'
+            )
+            print("Processing val data...")
+            FloodDataset(
+                root=os.path.join(script_dir, 'data/flood_dataset_val_multiyear'),
+                wldas_dir=wldas_base_dir,
+                flood_csv=os.path.join(script_dir, 'USFD_v1.0.csv'),
+                mode='val'
+            )
+            print("Processing test data...")
+            FloodDataset(
+                root=os.path.join(script_dir, 'data/flood_dataset_test_multiyear'),
+                wldas_dir=wldas_base_dir,
+                flood_csv=os.path.join(script_dir, 'USFD_v1.0.csv'),
+                mode='test'
+            )
+            print("--- Rank 0: Data Pre-processing Finished ---")
+
+        # Use a barrier to synchronize all processes.
+        # This ensures that no process continues until rank 0 has finished pre-processing.
+        dist.barrier()
+
+        # Now, all processes can safely instantiate the datasets.
+        # The data will be loaded from the cache, not re-processed.
+        print(f"Rank {rank}: Loading datasets from cache...")
         train_dataset = FloodDataset(
             root=os.path.join(script_dir, 'data/flood_dataset_train_multiyear'), 
             wldas_dir=wldas_base_dir,
