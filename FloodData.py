@@ -28,14 +28,16 @@ def process_single_day(idx, processed_dir, wldas_files, floods_by_date, agg_grid
         all_features = []
         for f in wldas_window_files:
             with xr.open_dataset(f) as ds:
-                features = ds[feature_vars].to_array(dim="variable").values
+                # Squeeze the singleton time dimension immediately after loading
+                features = ds[feature_vars].to_array(dim="variable").values.squeeze()
                 
                 # Downsample the spatial dimensions of the features
                 zoom_factors = (1, 1 / downsample_factor, 1 / downsample_factor)
                 downsampled_features = zoom(features, zoom_factors, order=1, prefilter=False)
 
-                downsampled_features = downsampled_features.squeeze().transpose(1, 2, 0)
-                reshaped_features = downsampled_features.reshape(-1, len(feature_vars))
+                # Transpose and reshape
+                transposed_features = downsampled_features.transpose(1, 2, 0)
+                reshaped_features = transposed_features.reshape(-1, len(feature_vars))
             
             # --- Create historical flood feature for this day ---
             date_part = os.path.basename(f).split('_')[-1].split('.')[0]
@@ -281,7 +283,7 @@ class FloodDataset(Dataset):
         print("Flood data pre-processing finished.")
 
         # --- Parallel processing of daily graph data ---
-        num_cores = min(cpu_count(), 12) # Cap at 4 cores to prevent OOM errors on large datasets
+        num_cores = min(cpu_count(), 50) # Cap at 4 cores to prevent OOM errors on large datasets
         print(f"Processing {self.len()} days of data using {num_cores} cores...")
 
         # Use functools.partial to pre-fill arguments for the worker function
