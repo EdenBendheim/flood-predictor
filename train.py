@@ -376,63 +376,60 @@ def main(rank, world_size):
                     print("Loaded best model for final evaluation.")
 
             # --- Final Test Evaluation ---
-            test_total_loss = 0
-            test_tp, test_fp, test_fn, test_tn = 0, 0, 0, 0
-            all_test_probs, all_test_labels = [], []
+            all_test_preds, all_test_labels, all_test_probs = [], [], []
+            
             test_progress_bar = tqdm(test_day_loader, desc="Final Test", unit="day", total=len(test_sampler), disable=(rank != 0 or not sys.stdout.isatty()))
             for day_data in test_progress_bar:
                 day_loss, day_preds, day_labels, day_probs = test_one_day(model_to_test, day_data, device)
-                test_total_loss += day_loss
                 
-                test_tp += ((day_preds == 1) & (day_labels == 1)).sum().item()
-                test_fp += ((day_preds == 1) & (day_labels == 0)).sum().item()
-                test_fn += ((day_preds == 0) & (day_labels == 1)).sum().item()
-                test_tn += ((day_preds == 0) & (day_labels == 0)).sum().item()
-                
-                # We still need to gather these for the MAE and plotting
-                all_test_probs.append(day_probs)
+                # Collect all raw tensors from each day
+                all_test_preds.append(day_preds)
                 all_test_labels.append(day_labels)
+                all_test_probs.append(day_probs)
 
-            # Reduce the integer metrics
-            test_metrics_tensor = torch.tensor([test_tp, test_fp, test_fn, test_tn], dtype=torch.float32).to(device)
-            dist.reduce(test_metrics_tensor, dst=0, op=dist.ReduceOp.SUM)
-            
-            # Gather the tensor lists for plotting and MAE
-            gathered_test_probs = [None] * world_size
+            # Gather the tensor lists from all processes for a final, global calculation
+            gathered_test_preds = [None] * world_size
             gathered_test_labels = [None] * world_size
-            dist.all_gather_object(gathered_test_probs, all_test_probs)
+            gathered_test_probs = [None] * world_size
+            dist.all_gather_object(gathered_test_preds, all_test_preds)
             dist.all_gather_object(gathered_test_labels, all_test_labels)
+            dist.all_gather_object(gathered_test_probs, all_test_probs)
 
             if rank == 0:
-                # Unpack reduced metrics
-                total_tp, total_fp, total_fn, total_tn = test_metrics_tensor.cpu().numpy()
-
-                # Unpack gathered lists for plotting/MAE
-                all_probs_list = [item for sublist in gathered_test_probs for item in sublist]
+                # Unpack gathered lists
+                all_preds_list = [item for sublist in gathered_test_preds for item in sublist]
                 all_labels_list = [item for sublist in gathered_test_labels for item in sublist]
+                all_probs_list = [item for sublist in gathered_test_probs for item in sublist]
                 
-                # Calculate average loss on rank 0's data
-                avg_test_loss = test_total_loss / len(test_sampler) if len(test_sampler) > 0 else 0
-                
-                if all_probs_list and all_labels_list:
+                if all_preds_list and all_labels_list:
+                    # Concatenate all tensors to get global results
+                    all_preds = torch.cat(all_preds_list)
                     all_labels_float = torch.cat(all_labels_list)
                     all_probs = torch.cat(all_probs_list)
-                    smudge_mae = torch.nn.functional.l1_loss(all_probs, all_labels_float).item()
-                else:
-                    smudge_mae = 0
+                    all_labels_binary = all_labels_float.long()
 
-                precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
-                recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
-                f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-                accuracy = (total_tp + total_tn) / (total_tp + total_tn + total_fp + total_fn) if (total_tp + total_tn + total_fp + total_fn) > 0 else 0
-                
-                print(f'\nFinal Test Set Metrics:')
-                print(f'  Avg Test Loss: {avg_test_loss:.4f}')
-                print(f'  Test Metrics: Accuracy: {accuracy:.4f} | F1-Score: {f1_score:.4f} | Smudge MAE: {smudge_mae:.4f}')
-                print(f'    > Precision: {precision:.4f} | Recall: {recall:.4f}')
-                total_predicted_floods = total_tp + total_fp
-                total_actual_floods = total_tp + total_fn
-                print(f'    > Missed Floods (FN): {int(total_fn)} | False Alarms (FP): {int(total_fp)} | Total Predicted Floods: {int(total_predicted_floods)} | Total Floods: {int(total_actual_floods)}')
+                    # Calculate all metrics globally
+                    tp = ((all_preds == 1) & (all_labels_binary == 1)).sum().item()
+                    fp = ((all_preds == 1) & (all_labels_binary == 0)).sum().item()
+                    fn = ((all_preds == 0) & (all_labels_binary == 1)).sum().item()
+                    tn = ((all_preds == 0) & (all_labels_binary == 0)).sum().item()
+                    
+                    smudge_mae = torch.nn.functional.l1_loss(all_probs, all_labels_float).item()
+                    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                    f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+                    accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
+                    
+                    # Note: This loss is an approximation based on rank 0's data
+                    avg_test_loss = 0 # This metric is not easily calculated globally
+
+                    print(f'\nFinal Test Set Metrics:')
+                    print(f'  Avg Test Loss (approx): {avg_test_loss:.4f}')
+                    print(f'  Test Metrics: Accuracy: {accuracy:.4f} | F1-Score: {f1_score:.4f} | Smudge MAE: {smudge_mae:.4f}')
+                    print(f'    > Precision: {precision:.4f} | Recall: {recall:.4f}')
+                    total_predicted_floods = tp + fp
+                    total_actual_floods = tp + fn
+                    print(f'    > Missed Floods (FN): {int(fn)} | False Alarms (FP): {int(fp)} | Total Predicted Floods: {int(total_predicted_floods)} | Total Floods: {int(total_actual_floods)}')
 
             # --- Plotting (only on rank 0) ---
             if rank == 0:
@@ -442,11 +439,11 @@ def main(rank, world_size):
                     history['val_loss'],
                     save_path=os.path.join(script_dir, 'loss_curve.png')
                 )
-                if all_labels_list and all_probs_list:
+                if all_labels_list and all_preds_list:
                     # For the plot, we only need one day's worth of data
                     plot_spatial_predictions(
                         all_labels_list[0],
-                        (torch.cat(all_probs_list) > 0.5).long(), # Recreate preds for one day for plotting
+                        all_preds_list[0],
                         test_dataset,
                         save_path=os.path.join(script_dir, 'spatial_prediction_map.png')
                     )
