@@ -281,7 +281,7 @@ class FloodDataset(Dataset):
         print("Flood data pre-processing finished.")
 
         # --- Parallel processing of daily graph data ---
-        num_cores = min(cpu_count(), 16) # Cap at 16 cores to be reasonable
+        num_cores = min(cpu_count(), 12) # Cap at 4 cores to prevent OOM errors on large datasets
         print(f"Processing {self.len()} days of data using {num_cores} cores...")
 
         # Use functools.partial to pre-fill arguments for the worker function
