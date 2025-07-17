@@ -40,8 +40,15 @@ def process_fire_events(fire_data_dir, output_path):
     all_fires_gdf['FireID'] = all_fires_gdf['FireID'].astype(str)
 
     # --- Create the Manifest by Aggregating Daily Records ---
+    from shapely.ops import unary_union
     manifest_data = []
     
+    # Check CRS for area calculation
+    if all_fires_gdf.crs:
+        print(f"\nCRS found: {all_fires_gdf.crs}\n")
+    else:
+        print("\nWarning: No CRS found. Area calculations may be incorrect.\n")
+
     # Group by the unique fire ID
     for fire_id, group in tqdm(all_fires_gdf.groupby('FireID'), desc="Aggregating fire events"):
         # Sort the fire's history by the time column 't'
@@ -50,15 +57,24 @@ def process_fire_events(fire_data_dir, output_path):
         start_t = group['t'].min()
         end_t = group['t'].max()
         
-        # Get the geometry of the final day of the fire
-        final_perimeter_geom = group.loc[group['t'].idxmax()]['geometry']
+        # Calculate the union of all daily perimeters for the fire
+        union_geom = unary_union(group['geometry'])
+
+        # Project to an equal-area projection (California Albers - EPSG:3310) to get area in meters
+        # Create a GeoSeries from the union geometry to perform the projection
+        geom_gs = gpd.GeoSeries([union_geom], crs=all_fires_gdf.crs)
+        geom_proj = geom_gs.to_crs('EPSG:3310')
+        
+        # Calculate area in square kilometers
+        area_sq_km = geom_proj.area.iloc[0] / 1e6
 
         manifest_data.append({
             'fire_id': fire_id,
             'start_t': start_t,
             'end_t': end_t,
             'duration_days': end_t - start_t + 1,
-            'final_geometry_wkt': final_perimeter_geom.wkt
+            'union_geometry_wkt': union_geom.wkt,
+            'union_area_sq_km': area_sq_km
         })
 
     manifest_df = pd.DataFrame(manifest_data)
