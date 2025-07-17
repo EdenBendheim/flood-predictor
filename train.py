@@ -10,18 +10,20 @@ import sys
 import torch.optim as optim
 from tqdm import tqdm
 import torch.nn as nn
-from torch_geometric.loader import NeighborLoader
+from torch_geometric.loader import DataLoader
 from torch.cuda.amp import GradScaler
 import threading
 import queue
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import Subset
 from torch.utils.data.distributed import DistributedSampler
 import gc
 import numpy as np
 import matplotlib.pyplot as plt
 import geopandas as gpd
+import argparse
+import yaml
 
 from FloodData import FloodDataset
 from gcn_model import SpatioTemporalGCN
@@ -43,21 +45,22 @@ def cleanup():
     """Cleans up the distributed environment."""
     dist.destroy_process_group()
 
-def train_one_day(model, day_data, optimizer, device, scaler):
+def train_one_batch(model, batch_data, optimizer, device, scaler):
     model.train()
-    day_data = day_data.to(device)
+    batch_data = batch_data.to(device)
     optimizer.zero_grad(set_to_none=True)
     
     with torch.amp.autocast(device_type=device.type):
-        out = model(day_data)
+        out = model(batch_data)
         
         if torch.isnan(out).any() or torch.isinf(out).any():
             print(f"WARNING: NaN or Inf detected in model output!")
-        if torch.isnan(day_data.y).any() or torch.isinf(day_data.y).any():
+        if torch.isnan(batch_data.y).any() or torch.isinf(batch_data.y).any():
             print(f"WARNING: NaN or Inf detected in targets!")
         
-        num_positives = day_data.y.sum()
-        num_negatives = len(day_data.y) - num_positives
+        # --- Weighted Loss for Backpropagation ---
+        num_positives = batch_data.y.sum()
+        num_negatives = len(batch_data.y) - num_positives
         pos_weight = num_negatives / num_positives if num_positives > 0 else torch.tensor(1.0, device=device)
         
         if torch.isnan(pos_weight) or torch.isinf(pos_weight):
@@ -65,35 +68,42 @@ def train_one_day(model, day_data, optimizer, device, scaler):
             pos_weight = torch.tensor(1.0, device=device)
         
         pos_weight = torch.clamp(pos_weight, min=1.0, max=10000.0)
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-        loss = criterion(out, day_data.y)
+        criterion_weighted = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        loss_weighted = criterion_weighted(out, batch_data.y)
         
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"CRITICAL: NaN or Inf loss detected! Skipping day.")
+        if torch.isnan(loss_weighted) or torch.isinf(loss_weighted):
+            print(f"CRITICAL: NaN or Inf weighted loss detected! Skipping batch.")
             return 0
+
+        # --- Unweighted Loss for Logging ---
+        # We calculate this separately for plotting, so we can compare apples to apples.
+        criterion_unweighted = nn.BCEWithLogitsLoss()
+        loss_unweighted = criterion_unweighted(out, batch_data.y)
     
-    scaler.scale(loss).backward()
+    # Use the weighted loss for the backward pass, as it's better for training
+    scaler.scale(loss_weighted).backward()
     scaler.unscale_(optimizer)
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     scaler.step(optimizer)
     scaler.update()
     
-    return loss.item()
+    # Return the unweighted loss for plotting and logging
+    return loss_unweighted.item()
 
 @torch.no_grad()
-def test_one_day(model, day_data, device):
+def test_one_batch(model, batch_data, device):
     model.eval()
-    day_data = day_data.to(device)
+    batch_data = batch_data.to(device)
     
     with torch.amp.autocast(device_type=device.type):
-        out = model(day_data)
+        out = model(batch_data)
         criterion = nn.BCEWithLogitsLoss()
-        loss = criterion(out, day_data.y)
+        loss = criterion(out, batch_data.y)
     
     probs = out.sigmoid()
     preds = (probs > 0.5).long()
     
-    return loss.item(), preds.cpu(), day_data.y.cpu(), probs.cpu()
+    return loss.item(), preds.cpu(), batch_data.y.cpu(), probs.cpu()
 
 def plot_loss_curve(epochs, train_losses, val_losses, save_path):
     """Plots the training and validation loss curves."""
@@ -105,6 +115,7 @@ def plot_loss_curve(epochs, train_losses, val_losses, save_path):
     plt.ylabel('Loss')
     plt.legend()
     plt.grid(True)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.savefig(save_path)
     plt.close()
     print(f"Loss curve saved to {save_path}")
@@ -117,10 +128,11 @@ def plot_spatial_predictions(day_labels, day_preds, dataset, shapefile_path, sav
         print(f"Could not read shapefile from {shapefile_path}, skipping map plot: {e}")
         return
 
-    # --- Get Geospatial Info from the dataset object ---
-    lat_min, lat_max = dataset.lat_min, dataset.lat_max
-    lon_min, lon_max = dataset.lon_min, dataset.lon_max
-    n_rows, n_cols = dataset.n_rows, dataset.n_cols
+    # --- Get Geospatial Info from the dataset object's graph_data attribute ---
+    # The dataset object now correctly stores its own boundaries within its graph_data.
+    lat_min, lat_max = dataset.graph_data.lat_min.item(), dataset.graph_data.lat_max.item()
+    lon_min, lon_max = dataset.graph_data.lon_min.item(), dataset.graph_data.lon_max.item()
+    n_rows, n_cols = dataset.graph_data.n_rows.item(), dataset.graph_data.n_cols.item()
 
     # --- Reshape data to 2D grid ---
     truth_grid = day_labels.numpy().reshape(n_rows, n_cols)
@@ -139,142 +151,145 @@ def plot_spatial_predictions(day_labels, day_preds, dataset, shapefile_path, sav
     ax.set_ylim(lat_min, lat_max)
     us_states.plot(ax=ax, edgecolor='black', facecolor='none', linewidth=0.5)
 
-    # --- Overlay heatmaps for truth and predictions ---
-    # Use different colors and slight transparency
-    # Plotting non-zero values only for clarity
-    
-    # Ground Truth (Blue)
-    true_lats = lat_grid[truth_grid > 0]
-    true_lons = lon_grid[truth_grid > 0]
-    ax.scatter(true_lons, true_lats, color='blue', alpha=0.7, label='Actual Floods', marker='s', s=10)
+    # --- Overlay heatmaps for different categories ---
+    # True Positives (Green): Correctly predicted floods
+    tp_mask = (truth_grid > 0) & (pred_grid > 0)
+    tp_lats = lat_grid[tp_mask]
+    tp_lons = lon_grid[tp_mask]
+    if tp_lats.size > 0:
+        ax.scatter(tp_lons, tp_lats, color='green', alpha=0.7, label='Correctly Predicted', marker='s', s=10)
 
-    # Predictions (Red)
-    pred_lats = lat_grid[pred_grid > 0]
-    pred_lons = lon_grid[pred_grid > 0]
-    ax.scatter(pred_lons, pred_lats, color='red', alpha=0.7, label='Predicted Floods', marker='s', s=10)
+    # False Negatives (Blue): Actual floods that were missed
+    fn_mask = (truth_grid > 0) & (pred_grid == 0)
+    fn_lats = lat_grid[fn_mask]
+    fn_lons = lon_grid[fn_mask]
+    if fn_lats.size > 0:
+        ax.scatter(fn_lons, fn_lats, color='blue', alpha=0.7, label='Missed Flood', marker='s', s=10)
 
-    ax.set_title('Spatial Comparison of Floods: Actual vs. Predicted (First Test Day)')
+    # False Positives (Red): Predicted floods that were not actual floods
+    fp_mask = (truth_grid == 0) & (pred_grid > 0)
+    fp_lats = lat_grid[fp_mask]
+    fp_lons = lon_grid[fp_mask]
+    if fp_lats.size > 0:
+        ax.scatter(fp_lons, fp_lats, color='red', alpha=0.7, label='False Alarm', marker='s', s=10)
+
+    ax.set_title('Spatial Comparison of Flood Prediction Accuracy (51st Test Day)')
     ax.set_xlabel('Longitude')
     ax.set_ylabel('Latitude')
     ax.legend()
     ax.grid(True)
     
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.savefig(save_path)
     plt.close()
     print(f"Spatial prediction map saved to {save_path}")
 
-def main(rank, world_size):
+def main(rank, world_size, args, config):
     setup(rank, world_size)
     
     try:
         # --- Hyperparameters ---
-        EPOCHS = 10
-        LEARNING_RATE = 0.001 * world_size # Scale learning rate
-        HIDDEN_DIM = 256
-        GCN_LAYERS = 8
+        # All hyperparameters are now loaded from the config file.
+        EPOCHS = config['training']['epochs']
+        if args.finetune:
+            EPOCHS = config['training']['finetune_epochs']
+        LEARNING_RATE = config['training']['learning_rate'] * world_size # Scale learning rate
         
         # --- Setup ---
         script_dir = os.path.dirname(os.path.abspath(__file__))
         device = torch.device(f'cuda:{rank}')
         
         # --- Dataset ---
-        wldas_base_dir = os.path.join(script_dir, 'WLDAS')
+        wldas_base_dir = os.path.join(script_dir, config['data']['wldas_dir'])
         
-        # Designate rank 0 as the sole data processor to prevent race conditions.
+        # With the new data pipeline, we instantiate one dataset and then split it.
+        # The pre-processing check is now handled automatically within the FloodDataset class.
+        # All ranks will either wait for rank 0 to process, or load from cache.
         if rank == 0:
-            print("--- Rank 0: Starting Data Pre-processing check ---")
-            # Instantiating the datasets will trigger the `process` method if data is not cached.
-            # This will be done sequentially for train, val, and test.
-            print("Processing train data...")
-            FloodDataset(
-                root=os.path.join(script_dir, 'data/flood_dataset_train_multiyear'),
-                wldas_dir=wldas_base_dir,
-                flood_csv=os.path.join(script_dir, 'USFD_v1.0.csv'),
-                mode='train'
-            )
-            print("Processing val data...")
-            FloodDataset(
-                root=os.path.join(script_dir, 'data/flood_dataset_val_multiyear'),
-                wldas_dir=wldas_base_dir,
-                flood_csv=os.path.join(script_dir, 'USFD_v1.0.csv'),
-                mode='val'
-            )
-            print("Processing test data...")
-            FloodDataset(
-                root=os.path.join(script_dir, 'data/flood_dataset_test_multiyear'),
-                wldas_dir=wldas_base_dir,
-                flood_csv=os.path.join(script_dir, 'USFD_v1.0.csv'),
-                mode='test'
-            )
-            print("--- Rank 0: Data Pre-processing Finished ---")
-
-        # Use a barrier to synchronize all processes.
-        # This ensures that no process continues until rank 0 has finished pre-processing.
-        dist.barrier()
-
-        # Now, all processes can safely instantiate the datasets.
-        # The data will be loaded from the cache, not re-processed.
-        print(f"Rank {rank}: Loading datasets from cache...")
-        train_dataset = FloodDataset(
-            root=os.path.join(script_dir, 'data/flood_dataset_train_multiyear'), 
+            print("--- Loading and preparing dataset... ---")
+        
+        full_dataset = FloodDataset(
+            root=os.path.join(script_dir, config['data']['root_dir']),
             wldas_dir=wldas_base_dir,
-            flood_csv=os.path.join(script_dir, 'USFD_v1.0.csv'),
-            mode='train'
-        )
-        val_dataset = FloodDataset(
-            root=os.path.join(script_dir, 'data/flood_dataset_val_multiyear'),
-            wldas_dir=wldas_base_dir,
-            flood_csv=os.path.join(script_dir, 'USFD_v1.0.csv'),
-            mode='val'
-        )
-        test_dataset = FloodDataset(
-            root=os.path.join(script_dir, 'data/flood_dataset_test_multiyear'),
-            wldas_dir=wldas_base_dir,
-            flood_csv=os.path.join(script_dir, 'USFD_v1.0.csv'),
-            mode='test'
+            flood_csv=os.path.join(script_dir, config['data']['flood_csv']),
+            config=config # Pass the whole config dict
         )
         
+        # --- Split the dataset into train, validation, and test sets ---
+        # We perform a chronological split to prevent data leakage.
+        total_size = len(full_dataset)
+        train_ratio = config['training']['split_ratios']['train']
+        val_ratio = config['training']['split_ratios']['val']
+        train_size = int(train_ratio * total_size)
+        val_size = int(val_ratio * total_size)
+        test_size = total_size - train_size - val_size
+
+        indices = list(range(total_size))
+        train_indices = indices[:train_size]
+        val_indices = indices[train_size : train_size + val_size]
+        test_indices = indices[train_size + val_size:]
+
+        train_dataset = Subset(full_dataset, train_indices)
+        val_dataset = Subset(full_dataset, val_indices)
+        test_dataset = Subset(full_dataset, test_indices)
+        
+        if rank == 0:
+            print(f"Chronological split: {len(train_dataset)} train, {len(val_dataset)} val, {len(test_dataset)} test samples.")
+        
+        # The sampler for training should shuffle the order of samples within the training period each epoch.
         train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        # For validation and testing, we do not shuffle to ensure consistent evaluation.
         val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
         test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False)
 
-        # Use a standard DataLoader to iterate over days, which is more robust
-        # than the custom prefetcher for managing worker processes.
-        train_day_loader = DataLoader(
+        # Use the PyG DataLoader which understands how to batch graph data.
+        train_loader = DataLoader(
             train_dataset,
+            batch_size=config['training']['batch_size'],
             sampler=train_sampler,
-            batch_size=None,  # Important: yields one day_data at a time
-            num_workers=2, # A few persistent workers to load day files
+            num_workers=config['training']['dataloader_workers'],
             prefetch_factor=2,
             persistent_workers=True,
         )
-        val_day_loader = DataLoader(
+        val_loader = DataLoader(
             val_dataset,
+            batch_size=config['training']['batch_size'],
             sampler=val_sampler,
-            batch_size=None,
-            num_workers=2,
+            num_workers=config['training']['dataloader_workers'],
             prefetch_factor=2,
             persistent_workers=True,
         )
-        test_day_loader = DataLoader(
+        test_loader = DataLoader(
             test_dataset,
+            batch_size=config['training']['batch_size'],
             sampler=test_sampler,
-            batch_size=None,
-            num_workers=2,
+            num_workers=config['training']['dataloader_workers'],
             prefetch_factor=2,
             persistent_workers=True,
         )
 
         # --- Model ---
-        # Load one sample to infer model dimensions
-        sample_data = next(iter(train_day_loader))
+        # Load one sample to infer model dimensions. We get it from the full dataset.
+        sample_data = full_dataset[0]
         model = SpatioTemporalGCN(
             static_feature_dim=sample_data.x_static.shape[1],
             dynamic_feature_dim=sample_data.x_dynamic.shape[2],
             sequence_length=sample_data.x_dynamic.shape[1],
-            hidden_dim=HIDDEN_DIM,
-            gcn_layers=GCN_LAYERS,
+            hidden_dim=config['model']['hidden_dim'],
+            gcn_layers=config['model']['gcn_layers'],
+            dropout=config['model']['dropout']
         ).to(device)
+        
+        if args.finetune:
+            best_model_path = os.path.join(script_dir, config['training']['save_dir'], config['training']['best_model_name'])
+            if os.path.exists(best_model_path):
+                # Load state dict on CPU first to avoid device mismatches, then move model to correct device
+                model.load_state_dict(torch.load(best_model_path, map_location='cpu'))
+                model.to(device)
+                if rank == 0:
+                    print(f"Loaded best model from {best_model_path} for fine-tuning.")
+            elif rank == 0:
+                print(f"WARNING: --finetune flag was set, but best model not found at {best_model_path}. Starting from scratch.")
         
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
         
@@ -291,14 +306,14 @@ def main(rank, world_size):
             train_sampler.set_epoch(epoch)
             epoch_total_loss = 0
             
-            # The loader now yields one full day's data graph at a time
-            progress_bar = tqdm(train_day_loader, desc=f"Epoch {epoch:02d}", unit="day", total=len(train_sampler), disable=(rank != 0 or not sys.stdout.isatty()))
-            for day_data in progress_bar:
-                day_loss = train_one_day(model, day_data, optimizer, device, scaler)
-                epoch_total_loss += day_loss
-                progress_bar.set_postfix(loss=f'{day_loss:.4f}')
+            # The loader now yields batches of day graphs at a time
+            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch:02d}", unit="batch", total=len(train_loader), disable=(rank != 0 or not sys.stdout.isatty()))
+            for batch_data in progress_bar:
+                batch_loss = train_one_batch(model, batch_data, optimizer, device, scaler)
+                epoch_total_loss += batch_loss
+                progress_bar.set_postfix(loss=f'{batch_loss:.4f}')
             
-            avg_epoch_loss = epoch_total_loss / len(train_sampler) if len(train_sampler) > 0 else 0
+            avg_epoch_loss = epoch_total_loss / len(train_loader) if len(train_loader) > 0 else 0
             
             # --- Evaluation Step ---
             val_total_loss = 0
@@ -306,9 +321,9 @@ def main(rank, world_size):
             val_fp = 0
             val_fn = 0
             
-            val_progress_bar = tqdm(val_day_loader, desc=f"Epoch {epoch:02d} (Val)", unit="day", total=len(val_sampler), disable=(rank != 0 or not sys.stdout.isatty()))
-            for day_data in val_progress_bar:
-                day_loss, day_preds, day_labels, _ = test_one_day(model.module, day_data, device)
+            val_progress_bar = tqdm(val_loader, desc=f"Epoch {epoch:02d} (Val)", unit="batch", total=len(val_loader), disable=(rank != 0 or not sys.stdout.isatty()))
+            for batch_data in val_progress_bar:
+                day_loss, day_preds, day_labels, _ = test_one_batch(model.module, batch_data, device)
                 val_total_loss += day_loss
                 
                 # Calculate local metrics for the batch
@@ -327,7 +342,7 @@ def main(rank, world_size):
                 total_tp, total_fp, total_fn = metrics_tensor.cpu().numpy()
 
                 # --- Store history for plotting ---
-                avg_val_loss = val_total_loss / len(val_sampler) if len(val_sampler) > 0 else 0
+                avg_val_loss = val_total_loss / len(val_loader) if len(val_loader) > 0 else 0
                 history['train_loss'].append(avg_epoch_loss)
                 history['val_loss'].append(avg_val_loss) 
                 history['epochs'].append(epoch)
@@ -342,7 +357,7 @@ def main(rank, world_size):
                 print(f'    > Val Metrics: FN: {int(total_fn)} | FP: {int(total_fp)} | Total Predictions: {int(total_predicted_floods)} | Total Floods: {int(total_actual_floods)}')
 
                 # --- Save Model Checkpoints based on Validation F1 ---
-                save_dir = os.path.join(script_dir, 'saved_models')
+                save_dir = os.path.join(script_dir, config['training']['save_dir'])
                 os.makedirs(save_dir, exist_ok=True)
                 
                 # Save the latest model
@@ -352,7 +367,7 @@ def main(rank, world_size):
                 # Save the best model if validation F1 score has improved
                 if val_f1_score > best_val_f1_score:
                     best_val_f1_score = val_f1_score
-                    best_save_path = os.path.join(save_dir, 'best_flood_predictor.pth')
+                    best_save_path = os.path.join(save_dir, config['training']['best_model_name'])
                     torch.save(model.module.state_dict(), best_save_path)
                     print(f'New best model saved to {best_save_path} (Validation F1-Score: {best_val_f1_score:.4f})')
 
@@ -366,7 +381,7 @@ def main(rank, world_size):
             print("--- Running Final Evaluation on Test Set ---")
         
         # Load the best model for final testing
-        best_model_path = os.path.join(script_dir, 'saved_models', 'best_flood_predictor.pth')
+        best_model_path = os.path.join(script_dir, config['training']['save_dir'], config['training']['best_model_name'])
         model_to_test = model.module
         if os.path.exists(best_model_path):
             # Load state dict on CPU first to avoid device mismatches
@@ -375,14 +390,19 @@ def main(rank, world_size):
             if rank == 0:
                 print("Loaded best model for final evaluation.")
 
+        # The hardcoded metadata is no longer needed, it's in the dataset object.
+        underlying_dataset = test_dataset.dataset
+        if rank == 0 and not all(hasattr(underlying_dataset, attr) for attr in ['lat_min', 'lat_max', 'lon_min', 'lon_max', 'n_rows', 'n_cols']):
+             print("Warning: Geospatial metadata not found in dataset object. Map plotting may fail.")
+
         # --- Final Test Evaluation Loop ---
         test_tp, test_fp, test_fn, test_tn = 0, 0, 0, 0
         l1_sum, num_elements = 0.0, 0
         plot_labels, plot_preds = None, None
 
-        test_progress_bar = tqdm(test_day_loader, desc="Final Test", unit="day", total=len(test_sampler), disable=(rank != 0 or not sys.stdout.isatty()))
-        for i, day_data in enumerate(test_progress_bar):
-            day_loss, day_preds, day_labels, day_probs = test_one_day(model_to_test, day_data, device)
+        test_progress_bar = tqdm(test_loader, desc="Final Test", unit="batch", total=len(test_loader), disable=(rank != 0 or not sys.stdout.isatty()))
+        for i, batch_data in enumerate(test_progress_bar):
+            day_loss, day_preds, day_labels, day_probs = test_one_batch(model_to_test, batch_data, device)
             
             test_tp += ((day_preds == 1) & (day_labels == 1)).sum().item()
             test_fp += ((day_preds == 1) & (day_labels == 0)).sum().item()
@@ -392,9 +412,16 @@ def main(rank, world_size):
             l1_sum += torch.nn.functional.l1_loss(day_probs, day_labels, reduction='sum').item()
             num_elements += day_labels.numel()
             
-            if rank == 0 and i == 0:
-                plot_labels = day_labels
-                plot_preds = day_preds
+            if rank == 0 and i == 50:
+                # To plot a spatial map, we need to "unbatch" the first batch.
+                # The 'ptr' attribute tells us where each graph's nodes start and end.
+                node_slice_for_first_graph = slice(batch_data.ptr[0], batch_data.ptr[1])
+                
+                # Slice both the predictions and the labels from the batch tensors
+                # to ensure they are consistent.
+                plot_preds = day_preds[node_slice_for_first_graph]
+                plot_labels = day_labels[node_slice_for_first_graph]
+
 
         # Reduce all metrics from all processes
         metrics_tensor = torch.tensor([test_tp, test_fp, test_fn, test_tn, l1_sum, num_elements], dtype=torch.float64).to(device)
@@ -420,26 +447,57 @@ def main(rank, world_size):
             total_actual_floods = total_tp + total_fn
             print(f'    > Missed Floods (FN): {int(total_fn)} | False Alarms (FP): {int(total_fp)} | Total Predicted Floods: {int(total_predicted_floods)} | Total Floods: {int(total_actual_floods)}')
 
+            plot_dir = os.path.join(script_dir, 'plots')
             plot_loss_curve(
                 history['epochs'],
                 history['train_loss'],
                 history['val_loss'],
-                save_path=os.path.join(script_dir, 'loss_curve.png')
+                save_path=os.path.join(plot_dir, 'loss_curve.png')
             )
             if plot_labels is not None and plot_preds is not None:
-                shapefile_path = os.path.join(os.path.dirname(script_dir), "us-border")
+                shapefile_path = os.path.join(script_dir, config['data']['shapefile_path'])
                 plot_spatial_predictions(
                     plot_labels,
                     plot_preds,
-                    test_dataset,
+                    test_dataset.dataset, # Pass the underlying full dataset for geo-metadata
                     shapefile_path,
-                    save_path=os.path.join(script_dir, 'spatial_prediction_map.png')
+                    save_path=os.path.join(plot_dir, 'spatial_prediction_map.png')
                 )
 
     finally:
         cleanup()
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Flood Predictor Training Script')
+    parser.add_argument('--finetune', action='store_true', help='Load the best model and run for one epoch before testing.')
+    parser.add_argument('--config', type=str, default='config.yaml', help='Path to the configuration file.')
+    args = parser.parse_args()
+
+    # --- Load Configuration ---
+    try:
+        with open(args.config, 'r') as f:
+            config = yaml.safe_load(f)
+    except FileNotFoundError:
+        print(f"Error: Configuration file not found at {args.config}")
+        sys.exit(1)
+    except yaml.YAMLError as e:
+        print(f"Error parsing YAML file: {e}")
+        sys.exit(1)
+
+    # --- Single-threaded Data Pre-processing Check ---
+    # By instantiating the dataset once in the main process *before* spawning,
+    # we ensure that the potentially long pre-processing step is done only once.
+    # All spawned processes will then find the cached data and load it instantly.
+    print("--- Initializing Dataset: Pre-processing will run if needed. ---")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    FloodDataset(
+        root=os.path.join(script_dir, config['data']['root_dir']),
+        wldas_dir=os.path.join(script_dir, config['data']['wldas_dir']),
+        flood_csv=os.path.join(script_dir, config['data']['flood_csv']),
+        config=config
+    )
+    print("--- Dataset is ready. Starting training... ---")
+
     world_size = torch.cuda.device_count()
-    torch.multiprocessing.spawn(main, args=(world_size,), nprocs=world_size, join=True)
+    torch.multiprocessing.spawn(main, args=(world_size, args, config), nprocs=world_size, join=True)
  

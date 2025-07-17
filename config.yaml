@@ -1,0 +1,86 @@
+# config.yaml
+
+# General settings
+project_name: "Flood Predictor"
+
+# Data settings
+data:
+  # Base directory for all data inputs and outputs relative to the script location
+  root_dir: "data" 
+  wldas_dir: "WLDAS"
+  flood_csv: "USFD_v1.0.csv"
+  shapefile_path: "us-border"
+  
+  # Optional: Define a bounding box to subset the data.
+  # If 'enabled' is false, the full extent of the data will be used.
+  subset_bounds:
+    enabled: true
+    # The full WLDAS dataset extent.
+    lat_min: 25.065
+    lat_max: 40.00
+    lon_min: -110.00
+    lon_max: -89.025
+
+  # Optional: Filter the dataset to a specific range of years (inclusive).
+  # If 'enabled' is false, all available years will be used.
+  year_range:
+    enabled: true
+    start: 2003
+    end: 2013
+
+# Pre-processing settings
+preprocessing:
+  downsample_factor: 10
+  # The final grid shape after downsampling the DEM. Should match the downsampled WLDAS data.
+  target_shape: [279, 359]
+  # WLDAS variables to use as features. Historical flood data is added automatically.
+  feature_vars:
+    - 'Rainf_tavg'
+    - 'SoilMoi00_10cm_tavg'
+    - 'Snowf_tavg'
+    - 'Tair_f_tavg'
+    - 'Evap_tavg'
+    - 'SWE_tavg'
+    - 'Qs_tavg'
+    - 'Qsb_tavg'
+    - 'GWS_tavg'
+    - 'Qle_tavg'
+    - 'Qsm_tavg'
+    - 'Rainf_f_tavg'
+    - 'Snowcover_tavg'
+    - 'SnowDepth_tavg'
+    - 'SoilMoi10_40cm_tavg'
+    - 'SoilMoi40_100cm_tavg'
+    - 'SoilMoi100_200cm_tavg'
+    - 'WaterTableD_tavg'
+    - 'WT_tavg'
+
+# Training settings
+training:
+  epochs: 100
+  finetune_epochs: 1
+  learning_rate: 0.001
+  batch_size: 3
+  # Dataset split ratios
+  split_ratios:
+    train: 0.7
+    val: 0.15
+    # test size is inferred from train and val
+  dataloader_workers: 3
+  # Model checkpointing
+  save_dir: "saved_models"
+  best_model_name: "best_flood_predictor.pth"
+
+# Model architecture
+model:
+  sequence_length: 8
+  # Defines how to group and aggregate the input sequence.
+  # If empty, each day is a separate step.
+  # If specified, it's a list of lists. Each inner list defines a group of
+  # days (0-indexed) that will be averaged into a single step for the model.
+  # Example for "mean past": take the mean of the first 7 days (0-6) and
+  # the last day (7) as two separate steps.
+  aggregation_strategy: [[0, 1, 2, 3, 4, 5, 6], [7]] # e.g., [[0, 1, 2, 3, 4, 5, 6], [7]]
+  hidden_dim: 256
+  gcn_layers: 10
+  dropout: 0.5 

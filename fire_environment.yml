@@ -1,0 +1,23 @@
+name: fire-predictor
+channels:
+  - pytorch
+  - pyg
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pyg
+  - geopandas
+  - rioxarray
+  - dask
+  - xarray
+  - gdal
+  - pandas
+  - numpy
+  - tqdm
+  - matplotlib
+  - scikit-learn
+  - pyyaml 
